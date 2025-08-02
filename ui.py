@@ -1307,11 +1307,12 @@ class CongressTracker(QWidget):
                 row = self.stats_table.rowCount()
                 self.stats_table.insertRow(row)
                 
-                total_time = sum(s.get('duration', 0) for s in res_speeches)
-                speech_count = len(res_speeches)
-                
-                # Calculate average time (if durations were recorded)
-                if total_time > 0:
+                timed_speeches = [s for s in res_speeches if s.get('duration', 0) > 0]
+
+                total_time = sum(s['duration'] for s in timed_speeches)
+                speech_count = len(timed_speeches)
+
+                if speech_count > 0:
                     avg_seconds = total_time // speech_count
                     mins, secs = divmod(avg_seconds, 60)
                     time_str = f"{mins}:{secs:02d}"
@@ -2293,7 +2294,6 @@ class CongressTracker(QWidget):
                     lw.addItem(QListWidgetItem(name))
             return
 
-        # 2) Sort & assign speech ranks
         # 2) Sort & assign speech ranks by (speech count asc, recency desc)
         sorted_speakers = sorted(
             self.competitors,
