@@ -9,12 +9,11 @@ from PyQt6.QtWidgets import (
     QListWidget, QTabWidget, QListWidgetItem, QInputDialog, QFileDialog,
     QGridLayout, QGroupBox, QSpinBox, QScrollArea, QFrame, QMenu, QTextEdit, QDialog
 )
-from PyQt6.QtCore import Qt, QPropertyAnimation, QEasingCurve, QParallelAnimationGroup, QSize, QTimer, QRegularExpression, QEvent, QPoint, QAbstractAnimation
-from PyQt6.QtGui import QColor, QPalette, QFont, QRegularExpressionValidator, QTextDocument
-from models import Competitor
+from PyQt6.QtCore import Qt, QPropertyAnimation, QPoint, QTimer, QSize, QModelIndex, QParallelAnimationGroup
+from PyQt6.QtGui import QColor, QPalette, QFont
+from models import Competitor, HistoryItem
 import persistence
-from PyQt6.QtWidgets import QTabBar, QCheckBox, QStylePainter, QStyleOptionTab, QStyle, QButtonGroup, QRadioButton, QTableWidget, QHeaderView,QTableWidgetItem, QSizePolicy
-
+from PyQt6.QtWidgets import QTabBar, QCheckBox, QStylePainter, QStyleOptionTab, QStyle, QSizePolicy, QTableWidget, QHeaderView, QTableWidgetItem
 
 class ExpandingTabBar(QTabBar):
     def tabSizeHint(self, index):
@@ -40,21 +39,6 @@ class ExpandingTabBar(QTabBar):
             painter.drawControl(QStyle.ControlElement.CE_TabBarTabShape, option)
             painter.drawControl(QStyle.ControlElement.CE_TabBarTabLabel, option)
 
-
-class HistoryItem:
-    def __init__(self, action_type, competitor_name, count_type, old_value, new_value, timestamp):
-        self.action_type = action_type
-        self.competitor_name = competitor_name
-        self.count_type = count_type
-        self.old_value = old_value
-        self.new_value = new_value
-        self.timestamp = timestamp
-        
-    def display_text(self):
-        action = "gave speech" if self.action_type == 'speech' else "asked question"
-        return f"{self.timestamp}: {self.competitor_name} {action} (was {self.old_value}, now {self.new_value})"
-
-
 class CongressTracker(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -69,12 +53,12 @@ class CongressTracker(QWidget):
     def __init__(self):
         super().__init__()
         self.load_config()
-        
+
         # Window settings
         self.setup_fonts()
         self.setWindowTitle("Congress Tracker")
         self.setGeometry(100, 100, 600, 400)
-        
+
         # Data initialization
         self.competitors = []
         self.entered_names = []
@@ -88,61 +72,250 @@ class CongressTracker(QWidget):
         self.current_resolution = ""
         self.resolution_list = []
         self.current_side = "Affirmative"
-        
+        self.tracking_started = False
+
         # Initialize UI elements that will be created in init_ui
         self.side_indicator = None
         self.current_resolution_label = None
         self.next_speaker_label = None
         self.resolution_header = None
-        
+
         # Initialize UI
+        
         self.init_ui()
         self.apply_dark_mode()
         self.setup_timer()
+        self.speech_recency_order = []
+        self.question_recency_order = []
 
         self.update_lists()
 
         # Initial updates
         self.update_status(loaded=False)
         self.timer_checkbox.stateChanged.connect(self.on_timer_toggle)
-        
+
         # Connect signals
         self.speech_log_button.clicked.connect(self.on_speech_log_button_clicked)
         self.question_log_button.clicked.connect(self.on_question_log_button_clicked)
+        self.manual_reordering_speech_enabled  = True
+        self.manual_reordering_question_enabled = True
 
         # Double‑click handlers (now lists have items!)
-        self.speech_list.itemDoubleClicked.connect(self.on_speech_list_double_clicked)
-        self.question_list.itemDoubleClicked.connect(self.on_question_list_double_clicked)
-        
+        self.speech_list.doubleClicked.connect(self._on_speech_index_double_clicked)
+        self.question_list.doubleClicked.connect(self._on_question_index_double_clicked)
 
-        
+    def _on_speech_index_double_clicked(self, index: QModelIndex):
+        """Adapter from QListView's doubleClicked to your existing handler."""
+        # FIX #3: Only allow double-click after tracking has started
+        if not self.tracking_started:
+            return
+            
+        print("_on_speech_index_double_clicked was called")
+        item = self.speech_list.item(index.row())
+        if item:
+            self.on_speech_list_double_clicked(item)
 
-
-
-
+    def _on_question_index_double_clicked(self, index: QModelIndex):
+        # FIX #3: Only allow double-click after tracking has started
+        if not self.tracking_started:
+            return
+            
+        item = self.question_list.item(index.row())
+        if item:
+            self.on_question_list_double_clicked(item)
 
     def on_speech_list_double_clicked(self, item):
+        # 1) Get competitor
         name = item.data(Qt.ItemDataRole.UserRole) or item.text()
         if not name:
             return
+        comp = next((c for c in self.competitors if c.name == name), None)
+        if not comp:
+            return
+        self.pending_speech_competitor = comp
+
+        # 2) Show input row & populate combo
         self.speech_input_container.setVisible(True)
+        self.speech_name_input.clear()
+        self.speech_name_input.addItems(self.entered_names)
         self.speech_name_input.setCurrentText(name)
         self.speech_name_input.setFocus()
+
+        # 3) Reset button to initial state
+        try:
+            self.speech_log_button.clicked.disconnect()
+        except TypeError:
+            pass
+        self.speech_log_button.setText("▶ Log Speech")
         self.speech_log_button.setEnabled(True)
+        # Connect directly to start animation - no lambda needed
+        self.speech_log_button.clicked.connect(self.start_speech_animation_for_pending)
+
+        # 4) Ensure cancel is hidden until after slide
+        self.speech_cancel_button.setVisible(False)
+        
+        # 5) Connect text box changes to update pending competitor
+        try:
+            self.speech_name_input.currentTextChanged.disconnect()
+        except TypeError:
+            pass
+        self.speech_name_input.currentTextChanged.connect(self.update_pending_speech_competitor)
+
+    def update_pending_speech_competitor(self, text):
+        """Update pending speech competitor when text box changes"""
+        if not text.strip():
+            self.pending_speech_competitor = None
+            return
+        
+        competitor = self.find_competitor(text.strip())
+        if competitor:
+            self.pending_speech_competitor = competitor
+        else:
+            self.pending_speech_competitor = None
+
+    def update_pending_question_competitor(self, text):
+        """Update pending question competitor when text box changes"""
+        if not text.strip():
+            self.pending_question_competitor = None
+            return
+        
+        competitor = self.find_competitor(text.strip())
+        if competitor:
+            self.pending_question_competitor = competitor
+        else:
+            self.pending_question_competitor = None
+    def start_speech_animation_for_pending(self):
+        """Start speech animation using the pending competitor"""
+        if not self.pending_speech_competitor:
+            QMessageBox.information(self, "Select Competitor",
+                "Please choose a valid competitor from the drop-down to log a speech.")
+            return
+        
+        # FIX #1: Update button text BEFORE starting animation
+        competitor_name = self.pending_speech_competitor.name
+        self.speech_log_button.setText(f"✔ Log Speech for {competitor_name}")
+        
+        # Force UI update to make text change visible immediately
+        self.speech_log_button.repaint()
+        
+        # Slide‐away the combo, leaving side/time intact
+        anim = QParallelAnimationGroup(self)
+        combo_anim = QPropertyAnimation(self.speech_name_input, b"maximumWidth")
+        combo_anim.setDuration(250)
+        combo_anim.setStartValue(self.speech_name_input.width())
+        combo_anim.setEndValue(0)
+        anim.addAnimation(combo_anim)
+
+        # Slide the same button in
+        btn = self.speech_log_button
+        geom = btn.geometry()
+        btn.move(self.speech_input_container.width() + 10, geom.y())
+        btn_anim = QPropertyAnimation(btn, b"pos")
+        btn_anim.setDuration(250)
+        end = geom.topLeft()
+        btn_anim.setStartValue(end + QPoint(80, 0))
+        btn_anim.setEndValue(end)
+        anim.addAnimation(btn_anim)
+
+        # When done, just connect to confirm (text already updated above)
+        def on_done():
+            try: 
+                btn.clicked.disconnect()
+            except TypeError:
+                pass
+            btn.clicked.connect(self.confirm_log_speech)
+            self.speech_cancel_button.setVisible(True)
+        
+        anim.finished.connect(on_done)
+        anim.finished.connect(anim.deleteLater)
+        anim.start()
+
 
 
     def on_question_list_double_clicked(self, item):
+        # 1) Get competitor
         name = item.data(Qt.ItemDataRole.UserRole) or item.text()
-        print(f"[DEBUG] question double‑click got '{name}'")
         if not name:
             return
+        comp = next((c for c in self.competitors if c.name == name), None)
+        if not comp:
+            return
+        self.pending_question_competitor = comp
 
-        self.question_name_input.setCurrentText(name)
-        print(f"[DEBUG] q‑combo now '{self.question_name_input.currentText()}'")
+        # 2) Show input row & populate combo
         self.question_input_container.setVisible(True)
+        self.question_name_input.clear()
+        self.question_name_input.addItems(self.entered_names)
+        self.question_name_input.setCurrentText(name)
         self.question_name_input.setFocus()
-        self.question_log_button.setEnabled(True)
 
+        # 3) Reset button to initial state
+        try:
+            self.question_log_button.clicked.disconnect()
+        except TypeError:
+            pass
+        self.question_log_button.setText("▶ Log Question")
+        self.question_log_button.setEnabled(True)
+        self.question_log_button.clicked.connect(self.start_question_animation_for_pending)
+
+        # 4) Hide cancel until after the slide
+        self.question_cancel_button.setVisible(False)
+        
+        # 5) Connect text box changes to update pending competitor
+        try:
+            self.question_name_input.currentTextChanged.disconnect()
+        except TypeError:
+            pass
+        self.question_name_input.currentTextChanged.connect(self.update_pending_question_competitor)
+
+    def start_question_animation_for_pending(self):
+        """Start question animation using the pending competitor"""
+        if not self.pending_question_competitor:
+            QMessageBox.information(self, "Select Competitor",
+                "Please choose a valid competitor from the drop-down to log a question.")
+            return
+        
+        # FIX #1: Update button text BEFORE starting animation
+        competitor_name = self.pending_question_competitor.name
+        self.question_log_button.setText(f"✔ Log Question for {competitor_name}")
+        
+        # Force UI update to make text change visible immediately
+        self.question_log_button.repaint()
+        
+        # Show the full question row
+        self.question_input_container.setVisible(True)
+
+        # Hide cancel button during animation
+        self.question_cancel_button.setVisible(False)
+
+        anim = QParallelAnimationGroup(self)
+        combo_anim = QPropertyAnimation(self.question_name_input, b"maximumWidth")
+        combo_anim.setDuration(250)
+        combo_anim.setStartValue(self.question_name_input.width())
+        combo_anim.setEndValue(0)
+        anim.addAnimation(combo_anim)
+
+        btn = self.question_log_button
+        geom = btn.geometry()
+        btn.move(self.question_input_container.width() + 10, geom.y())
+        btn_anim = QPropertyAnimation(btn, b"pos")
+        btn_anim.setDuration(250)
+        end = geom.topLeft()
+        btn_anim.setStartValue(end + QPoint(80, 0))
+        btn_anim.setEndValue(end)
+        anim.addAnimation(btn_anim)
+
+        def on_done():
+            try: 
+                btn.clicked.disconnect()
+            except TypeError:
+                pass
+            btn.clicked.connect(self.confirm_log_question)
+            self.question_cancel_button.setVisible(True)
+        
+        anim.finished.connect(on_done)
+        anim.finished.connect(anim.deleteLater)
+        anim.start()
 
     def setup_fonts(self):
         # Use a monospace font that's available cross-platform
@@ -152,16 +325,13 @@ class CongressTracker(QWidget):
         self.mono_font.setFixedPitch(True)
         self.mono_font.setPointSize(10)
     def on_question_log_button_clicked(self):
-        # 1) First click: reveal the input row
-        if not self.question_input_container.isVisible():
-            self.question_input_container.setVisible(True)
-            return
+        # This ensures the input row is visible on the first click before proceeding.
+        self.question_input_container.setVisible(True)
 
-        # 2) Next clicks: do the usual checks and animation
         name = self.question_name_input.currentText().strip()
         if not name:
             QMessageBox.information(self, "Select Competitor",
-                "Please choose a competitor from the drop‑down to log a question.")
+                "Please choose a competitor from the drop-down to log a question.")
             return
 
         competitor = self.find_competitor(name)
@@ -170,7 +340,15 @@ class CongressTracker(QWidget):
             return
 
         self.pending_question_competitor = competitor
-        self.start_question_animation(competitor)
+        
+        # Connect text box changes to update pending competitor
+        try:
+            self.question_name_input.currentTextChanged.disconnect()
+        except TypeError:
+            pass
+        self.question_name_input.currentTextChanged.connect(self.update_pending_question_competitor)
+        
+        self.start_question_animation_for_pending()
 
 
 
@@ -214,13 +392,35 @@ class CongressTracker(QWidget):
         else:
             self.set_current_resolution("")
 
+    def move_competitor(self, name, direction, list_type):
+        '''Move competitor up (-1) or down (+1) in the given recency list.'''
+        order = self.speech_recency_order if list_type=='speech' else self.question_recency_order
+        idx = order.index(name)
+        new_idx = idx + direction
+        if 0 <= new_idx < len(order):
+            order[idx], order[new_idx] = order[new_idx], order[idx]
+            self.update_lists()
+
     def next_resolution(self):
-        if not self.resolution_list:
-            return
+            if not self.resolution_list:
+                return
+                
+            current_idx = self.resolution_list.index(self.current_resolution) if self.current_resolution in self.resolution_list else -1
+            next_idx = (current_idx + 1) % len(self.resolution_list)
+            self.current_resolution = self.resolution_list[next_idx]
             
-        current_idx = self.resolution_list.index(self.current_resolution) if self.current_resolution in self.resolution_list else -1
-        next_idx = (current_idx + 1) % len(self.resolution_list)
-        self.set_current_resolution(self.resolution_list[next_idx])
+            # Reset all competitor sides
+            for c in self.competitors:
+                c.current_side = ""
+            
+            # Reset to Affirmative side
+            self.current_side = "Affirmative"
+            
+            # Update UI - this was missing the proper UI updates
+            self.set_current_resolution(self.current_resolution)
+            self.update_resolution_display()  # Make sure all UI elements are updated
+            self.update_lists()
+            self.save_to_csv()
 
     def remove_resolution(self):
         selected = self.resolution_list_widget.currentItem()
@@ -592,7 +792,7 @@ class CongressTracker(QWidget):
             return
             
         try:
-            persistence.save_to_csv(self.csv_file_path, self.competitors)
+            persistence.save_to_csv(self.csv_file_path, self.competitors, self.history)
         except Exception as e:
             print(f"Error saving CSV: {e}")
 
@@ -607,10 +807,16 @@ class CongressTracker(QWidget):
         if reply == QMessageBox.StandardButton.Yes:
             self.competitors = []
             self.entered_names = []
+            self.history = []  # Clear history as well
             if self.csv_file_path and os.path.exists(self.csv_file_path):
                 persistence.clear_csv_data(self.csv_file_path)
+                # Also remove history file
+                history_filepath = self.csv_file_path.replace('.csv', '_history.json')
+                if os.path.exists(history_filepath):
+                    os.remove(history_filepath)
             self.reset_ui_to_initial_state()
             self.update_lists()
+            self.update_history_tab()  # Update history display
             self.update_status(loaded=False)
 
     def refresh_status(self):
@@ -690,6 +896,7 @@ class CongressTracker(QWidget):
                 self.last_modified_label.setText("<b>Last Modified:</b> N/A")
                 self.num_competitors_label.setText("<b>Competitors:</b> 0")
                 self.stats_label.setText("<b>Statistics:</b> No data available")
+                self.update_tab_indicators()
                 
         except Exception as e:
             print(f"Error updating status: {e}")
@@ -1255,6 +1462,7 @@ class CongressTracker(QWidget):
         self.update_resolution_display()
         self.load_resolution_state()
         self.tabs.currentChanged.connect(self.on_tab_changed)
+        self.update_tab_indicators()
 
 
     def toggle_timer_settings(self):
@@ -1540,16 +1748,13 @@ class CongressTracker(QWidget):
 
     # Update on_speech_log_button_clicked
     def on_speech_log_button_clicked(self):
-        # 1) If the input panel is still hidden, just show it
-        if not self.speech_input_container.isVisible():
-            self.speech_input_container.setVisible(True)
-            return
+        # This ensures the input row is visible on the first click before proceeding.
+        self.speech_input_container.setVisible(True)
 
-        # 2) Otherwise proceed with the existing logic
         name = self.speech_name_input.currentText().strip()
         if not name:
             QMessageBox.information(self, "Select Competitor",
-                "Please choose a competitor from the drop‑down to log a speech.")
+                "Please choose a competitor from the drop-down to log a speech.")
             return
 
         competitor = self.find_competitor(name)
@@ -1558,48 +1763,56 @@ class CongressTracker(QWidget):
             return
 
         self.pending_speech_competitor = competitor
-        self.start_speech_animation(competitor)
-
-
-
-
+        
+        # Connect text box changes to update pending competitor
+        try:
+            self.speech_name_input.currentTextChanged.disconnect()
+        except TypeError:
+            pass
+        self.speech_name_input.currentTextChanged.connect(self.update_pending_speech_competitor)
+        
+        self.start_speech_animation_for_pending()
 
     def start_question_animation(self, competitor):
-        # Make sure container is visible
+        # 1) Show the full question row
         self.question_input_container.setVisible(True)
 
-        # Prepare confirm & cancel buttons off to the right
-        for btn in (self.question_confirm_button, self.question_cancel_button):
-            btn.setVisible(True)
+        # 2) Prep the log button and hide cancel
+        self.question_log_button.setText("▶ Log Question")
+        self.question_cancel_button.setVisible(False)
+
+        try: self.question_log_button.clicked.disconnect()
+        except: pass
+        self.question_log_button.clicked.connect(lambda: _run_q())
+
+        def _run_q():
+            anim = QParallelAnimationGroup(self)
+            combo_anim = QPropertyAnimation(self.question_name_input, b"maximumWidth")
+            combo_anim.setDuration(250)
+            combo_anim.setStartValue(self.question_name_input.width())
+            combo_anim.setEndValue(0)
+            anim.addAnimation(combo_anim)
+
+            btn = self.question_log_button
             geom = btn.geometry()
             btn.move(self.question_input_container.width() + 10, geom.y())
+            btn_anim = QPropertyAnimation(btn, b"pos")
+            btn_anim.setDuration(250)
+            end = geom.topLeft()
+            btn_anim.setStartValue(end + QPoint(80, 0))
+            btn_anim.setEndValue(end)
+            anim.addAnimation(btn_anim)
 
-        # Animate: shrink the combo, slide buttons in
-        anim_group = QParallelAnimationGroup(self)
-        combo_anim = QPropertyAnimation(self.question_name_input, b"maximumWidth")
-        combo_anim.setDuration(300)
-        combo_anim.setStartValue(self.question_name_input.width())
-        combo_anim.setEndValue(0)
-        anim_group.addAnimation(combo_anim)
-
-        confirm_anim = QPropertyAnimation(self.question_confirm_button, b"pos")
-        confirm_anim.setDuration(300)
-        end_conf = self.question_confirm_button.geometry().topLeft()
-        confirm_anim.setStartValue(end_conf + QPoint(100, 0))
-        confirm_anim.setEndValue(end_conf)
-        anim_group.addAnimation(confirm_anim)
-
-        cancel_anim = QPropertyAnimation(self.question_cancel_button, b"pos")
-        cancel_anim.setDuration(300)
-        end_canc = self.question_cancel_button.geometry().topLeft()
-        cancel_anim.setStartValue(end_canc + QPoint(100, 0))
-        cancel_anim.setEndValue(end_canc)
-        anim_group.addAnimation(cancel_anim)
-
-        # When done, delete the animation object
-        anim_group.finished.connect(anim_group.deleteLater)
-        anim_group.start()
-        self.question_log_button.setText(f"Confirm Log for {competitor.name}?")
+            def on_done_q():
+                name = competitor.name
+                btn.setText(f"✔ Log Question for {name}")
+                try: btn.clicked.disconnect()
+                except: pass
+                btn.clicked.connect(self.confirm_log_question)
+                self.question_cancel_button.setVisible(True)
+            anim.finished.connect(on_done_q)
+            anim.finished.connect(anim.deleteLater)
+            anim.start()
 
 
 
@@ -1634,48 +1847,54 @@ class CongressTracker(QWidget):
             QMessageBox.warning(self, "Error", f"No competitor named '{name}' found.")
 
     def start_speech_animation(self, competitor):
-        # Make sure container is visible
+        # 1) Ensure the input row (with combo, side, time, buttons) is shown
         self.speech_input_container.setVisible(True)
 
-        # Prepare confirm & cancel buttons off to the right
-        for btn in (self.speech_confirm_button, self.speech_cancel_button):
-            btn.setVisible(True)
-            btn.raise_()
+        # 2) Prep buttons off to the right
+        #    We’ll use speech_log_button as both “▶ Log” and then “✔ Confirm”,
+        #    and speech_cancel_button stays the same.
+        self.speech_log_button.setText("▶ Log Speech")
+        self.speech_cancel_button.setVisible(False)
+
+        # Disconnect any old handlers, then make Log start the animation
+        try: self.speech_log_button.clicked.disconnect()
+        except: pass
+        self.speech_log_button.clicked.connect(lambda: _run())
+
+        def _run():
+            # Slide‐away the combo, leaving side/time intact
+            anim = QParallelAnimationGroup(self)
+            combo_anim = QPropertyAnimation(self.speech_name_input, b"maximumWidth")
+            combo_anim.setDuration(250)
+            combo_anim.setStartValue(self.speech_name_input.width())
+            combo_anim.setEndValue(0)
+            anim.addAnimation(combo_anim)
+
+            # Slide the same button in
+            btn = self.speech_log_button
             geom = btn.geometry()
             btn.move(self.speech_input_container.width() + 10, geom.y())
+            btn_anim = QPropertyAnimation(btn, b"pos")
+            btn_anim.setDuration(250)
+            end = geom.topLeft()
+            btn_anim.setStartValue(end + QPoint(80, 0))
+            btn_anim.setEndValue(end)
+            anim.addAnimation(btn_anim)
 
-        # Animate: shrink the combo, slide buttons in
-        anim_group = QParallelAnimationGroup(self)
-        combo_anim = QPropertyAnimation(self.speech_name_input, b"maximumWidth")
-        combo_anim.setDuration(300)
-        combo_anim.setStartValue(self.speech_name_input.width())
-        combo_anim.setEndValue(0)
-        anim_group.addAnimation(combo_anim)
+            # When done, swap to “Confirm” mode
+            def on_done():
+                name = competitor.name
+                btn.setText(f"✔ Log Speech for {name}")
+                try: btn.clicked.disconnect()
+                except: pass
+                btn.clicked.connect(self.confirm_log_speech)
+                self.speech_cancel_button.setVisible(True)
+            anim.finished.connect(on_done)
+            anim.finished.connect(anim.deleteLater)
+            anim.start()
 
-        confirm_anim = QPropertyAnimation(self.speech_confirm_button, b"pos")
-        confirm_anim.setDuration(300)
-        end_conf = self.speech_confirm_button.geometry().topLeft()
-        start_conf = end_conf + QPoint(100, 0)
-        confirm_anim.setStartValue(start_conf)
-        confirm_anim.setEndValue(end_conf)
-        anim_group.addAnimation(confirm_anim)
-
-        cancel_anim = QPropertyAnimation(self.speech_cancel_button, b"pos")
-        cancel_anim.setDuration(300)
-        end_canc = self.speech_cancel_button.geometry().topLeft()
-        start_canc = end_canc + QPoint(100, 0)
-        cancel_anim.setStartValue(start_canc)
-        cancel_anim.setEndValue(end_canc)
-        anim_group.addAnimation(cancel_anim)
-
-        # When done, delete the animation object
-        anim_group.finished.connect(anim_group.deleteLater)
-        anim_group.start()
-        self.speech_log_button.setText(f"Confirm Log for {competitor.name}?")
-
-
-
-
+        # Kick off the first-phase (so _run is defined)
+        # we don’t call it yet—only on button click
 
 
 
@@ -1691,7 +1910,7 @@ class CongressTracker(QWidget):
         /* Base colors */
         QWidget, QLineEdit, QComboBox, QTextEdit {
         background: #2D2D2D;
-        color: #E0E0E0;
+color: #E0E0E0;
         font-family: 'Segoe UI', Arial, sans-serif;
         font-size: 13px;
         }
@@ -1699,42 +1918,47 @@ class CongressTracker(QWidget):
         /* Containers */
         QTabWidget::pane, QGroupBox {
         background: #3A3A3A;
-        border: 1px solid #444;
+border: 1px solid #444;
         }
         QGroupBox {
         margin-top: 10px;
-        padding-top: 15px;
+padding-top: 15px;
         }
         QGroupBox::title {
         subcontrol-origin: margin;
-        left: 10px;
+left: 10px;
         padding: 0 3px;
         }
 
         /* Tabs */
         QTabBar::tab {
-        background: #3A3A3A; color: #BBBBBB;
+        background: #3A3A3A;
+color: #BBBBBB;
         padding: 8px 16px; margin-right: 2px;
         border: 1px solid #444;
         border-top-left-radius: 4px; border-top-right-radius: 4px;
-        }
-        QTabBar::tab:hover { background: #454545; }
-        QTabBar::tab:selected { background: #505050; color: #FFFFFF; border-bottom-color: #6D9EEB; }
+}
+        QTabBar::tab:hover { background: #454545;
+}
+        QTabBar::tab:selected { background: #505050; color: #FFFFFF; border-bottom-color: #6D9EEB;
+}
 
         /* Lists & Inputs */
         QListWidget, QLineEdit, QComboBox, QTextEdit {
-        background: #3A3A3A; border: 1px solid #444;
+        background: #3A3A3A;
+border: 1px solid #444;
         padding: 4px; font-size: 13px;
         }
         QListWidget {
         border-radius: 4px;
-        }
-        QListWidget::item:hover    { background: #444; }
+}
+        QListWidget::item:hover    { background: #444;
+}
         QListWidget::item:selected { background: #444}
+        
+
         """
         self.setStyleSheet(qss)
-
-
 
     def on_timer_toggle(self, state):
         enabled = state == Qt.CheckState.Checked.value
@@ -1822,13 +2046,14 @@ class CongressTracker(QWidget):
         if file_path:
             try:
                 self.csv_file_path = file_path
-                loaded_competitors = persistence.load_from_csv(self.csv_file_path)
+                loaded_competitors, loaded_history = persistence.load_from_csv(self.csv_file_path)
                 
                 if not loaded_competitors:
                     QMessageBox.warning(self, "Error", "The CSV file is empty or couldn't be parsed.")
                     return
                 
                 self.competitors = loaded_competitors
+                self.history = loaded_history  # Load the history
                 
                 # Initialize missing attributes for backward compatibility
                 for c in self.competitors:
@@ -1845,10 +2070,27 @@ class CongressTracker(QWidget):
                 max_question_round = max((c.last_question_round for c in self.competitors), default=0)
                 self.current_round = max(max_speech_round, max_question_round)
                 
+                # Initialize recency orders and tracking state
+                self.speech_recency_order = [c.name for c in self.competitors]
+                self.question_recency_order = [c.name for c in self.competitors]
+                
+                # Check if any competitor has logged speeches/questions to determine manual mode
+                has_speeches = any(c.speeches > 0 for c in self.competitors)
+                has_questions = any(c.questions > 0 for c in self.competitors)
+                
+                self.manual_reordering_speech_enabled = not has_speeches
+                self.manual_reordering_question_enabled = not has_questions
+                
+                self.entered_names = [c.name for c in self.competitors]
+                
+                # Mark as tracking started
+                self.tracking_started = True
+                
                 self.update_lists()
                 self.update_all_ui_post_start()
+                self.update_history_tab()  # Update history display
                 self.update_status(loaded=True, filepath=file_path)
-                
+                self.update_tab_indicators()
                 
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load CSV file: {str(e)}")
@@ -1857,19 +2099,14 @@ class CongressTracker(QWidget):
                 self.update_status(loaded=False)
 
     def update_tab_indicators(self):
-        tab_names = ["Speeches", "Questions", "Settings", "History", "Status", "Statistics","Credits"]
+        tab_names = ["Speeches", "Questions", "Settings", "History", "Status", "Statistics", "Credits"]
         current_index = self.tabs.currentIndex()
+        
+        # Simply set tab names without any indicators to prevent text cutoff
         for i, name in enumerate(tab_names):
-            if i == current_index:
-                if i == 4:  # Status tab
-                    self.tabs.setTabText(i, "● Status")
-                else:
-                    self.tabs.setTabText(i, f"● {name}")
-            else:
-                if i == 4:  # Status tab
-                    self.tabs.setTabText(i, "● Status")
-                else:
-                    self.tabs.setTabText(i, name)
+            if i < self.tabs.count():  # Make sure we don't exceed available tabs
+                self.tabs.setTabText(i, name)
+
 
     def add_name(self):
         input_text = self.name_input.text().strip()
@@ -1899,21 +2136,26 @@ class CongressTracker(QWidget):
                 if name.lower() not in [c.name.lower() for c in self.competitors]:
                     self.competitors.append(Competitor(name))
             self.name_input.clear()
-            self.update_lists()
 
         if not self.competitors:
                 QMessageBox.warning(self, "Error", "Please add competitors first!")
                 return
-            
+        
+        # FIX: Initialize recency order lists BEFORE the first UI update.
+        # This ensures the lists have data to draw from immediately.
+        self.speech_recency_order = [c.name for c in self.competitors]
+        self.question_recency_order = [c.name for c in self.competitors]
+        self.manual_reordering_speech_enabled   = True
+        self.manual_reordering_question_enabled = True
         # Set file path ONLY when starting tracking
         if not self.csv_file_path:
             self.csv_file_path = self.get_unique_file_path()
-
 
         # Update UI for tracking mode
         self.name_input.hide()
         self.instructions.hide()
         self.start_button.hide()
+        self.tracking_started = True
         
         # Enable question logging if using that feature
         if hasattr(self, 'question_log_button'):
@@ -1924,18 +2166,12 @@ class CongressTracker(QWidget):
         if hasattr(self, 'add_competitor_button'):
             self.add_competitor_button.setEnabled(True)
         
-        self.save_to_csv()
-        self.update_status(loaded=True, filepath=self.csv_file_path)
+        # Now that everything is set up, update the UI.
         self.update_lists()
         self.update_competitor_combos()
-        self.clear_log_inputs()
-        self.update_lists()
+        self.update_status(loaded=True, filepath=self.csv_file_path)
         self.update_tab_indicators()
-        # Refresh seating charts
-        if hasattr(self, 'speech_seating_chart_widget'):
-            self.speech_seating_chart_widget.init_ui()
-        if hasattr(self, 'question_seating_chart_widget'):
-            self.question_seating_chart_widget.init_ui()
+        self.save_to_csv()
 
     def update_all_ui_post_start(self):
         """Update UI after loading data or starting tracking"""
@@ -1956,7 +2192,16 @@ class CongressTracker(QWidget):
         self.clear_log_inputs()
         self.update_lists()
         self.update_tab_indicators()
-        # Refresh seating charts
+        
+        # Enable logging buttons
+        if hasattr(self, 'speech_log_button'):
+            self.speech_log_button.setEnabled(True)
+        if hasattr(self, 'question_log_button'):
+            self.question_log_button.setEnabled(True)
+        if hasattr(self, 'add_competitor_button'):
+            self.add_competitor_button.setEnabled(True)
+        
+        # Refresh seating charts if they exist
         if hasattr(self, 'speech_seating_chart_widget'):
             self.speech_seating_chart_widget.init_ui()
         if hasattr(self, 'question_seating_chart_widget'):
@@ -2121,6 +2366,7 @@ class CongressTracker(QWidget):
     
 
     def on_tab_changed(self, index):
+        self.update_tab_indicators()
         if index == 5:  # Statistics tab index
             self.update_stats_display()
     
@@ -2166,6 +2412,7 @@ class CongressTracker(QWidget):
 
         # 5) Refresh UI
         self.update_resolution_display()
+        self.manual_reordering_speech_enabled = False
         self.update_lists()
         self.save_to_csv()
         self.update_stats_display()
@@ -2179,6 +2426,10 @@ class CongressTracker(QWidget):
         self.pending_speech_competitor = None
         self.speech_list.clearSelection()
         self.speech_input_container.setVisible(False)
+
+        # FIX #1: Clear the time inputs after logging
+        self.minutes_input.clear()
+        self.seconds_input.clear()
 
 
 
@@ -2203,6 +2454,7 @@ class CongressTracker(QWidget):
         )
 
         # Refresh & persist
+        self.manual_reordering_question_enabled = False
         self.update_lists()
         self.save_to_csv()
 
@@ -2250,8 +2502,7 @@ class CongressTracker(QWidget):
         for competitor in self.competitors:
             if competitor.name.lower() == clean_name.lower():
                 return competitor
-        QMessageBox.warning(self, "Error", f"No competitor named '{clean_name}' found.")
-        return None
+        return None  # Don't show error message here, let caller handle it
     def rename_competitor(self):
         selected_items = self.manage_list.selectedItems()
         if not selected_items:
@@ -2294,39 +2545,45 @@ class CongressTracker(QWidget):
                     lw.addItem(QListWidgetItem(name))
             return
 
-        # 2) Sort & assign speech ranks by (speech count asc, recency desc)
-        sorted_speakers = sorted(
-            self.competitors,
-            key=lambda c: (
-                c.speeches,
-                -(self.current_round - (c.last_speech_round or 0))
+        # 2) Determine manual vs automatic modes
+        in_manual_speech = self.manual_reordering_speech_enabled
+        in_manual_question = self.manual_reordering_question_enabled
+
+        # 3) Build ordered lists
+        # Speech order: manual uses preserved list, else sort by count/recency
+        if in_manual_speech:
+            temp = {c.name: c for c in self.competitors}
+            speakers = [temp[name] for name in self.speech_recency_order if name in temp]
+        else:
+            speakers = sorted(
+                self.competitors,
+                key=lambda c: (c.speeches, -(self.current_round - (c.last_speech_round or 0)))
             )
-        )
-        for idx, comp in enumerate(sorted_speakers, start=1):
+        for idx, comp in enumerate(speakers, start=1):
             comp.speech_rank = idx
 
-        # 3) Sort & assign question ranks by (question count asc, recency desc)
-        sorted_askers = sorted(
-            self.competitors,
-            key=lambda c: (
-                c.questions,
-                -(self.current_round - (c.last_question_round or 0))
+        # Question order: manual vs automatic
+        if in_manual_question:
+            temp_q = {c.name: c for c in self.competitors}
+            askers = [temp_q[name] for name in self.question_recency_order if name in temp_q]
+        else:
+            askers = sorted(
+                self.competitors,
+                key=lambda c: (c.questions, -(self.current_round - (c.last_question_round or 0)))
             )
-        )
-
-        for idx, comp in enumerate(sorted_askers, start=1):
+        for idx, comp in enumerate(askers, start=1):
             comp.question_rank = idx
 
-        # 4) Compute fixed column widths once
+        # 4) Compute column widths
         fm = self.speech_list.fontMetrics()
-        name_w    = max(fm.horizontalAdvance(c.name) for c in self.competitors) + 20
-        marker_w  = fm.horizontalAdvance("|")
-        side_w    = fm.horizontalAdvance("Neg") + 10
-        label_w   = fm.horizontalAdvance("Speeches:")
-        count_w   = fm.horizontalAdvance("99") + 10
-        rank_w    = fm.horizontalAdvance("99") + 10
+        name_w   = max(fm.horizontalAdvance(c.name) for c in self.competitors) + 20
+        marker_w = fm.horizontalAdvance("|")
+        side_w   = fm.horizontalAdvance("Neg") + 10
+        label_w  = fm.horizontalAdvance("Speeches:")
+        count_w  = fm.horizontalAdvance("99") + 10
+        rec_w    = fm.horizontalAdvance("Recency:") + fm.horizontalAdvance("99")
 
-        # Helper to make a fixed‑width, non‑expanding label
+        # Helpers
         def make_label(text, fixed_w=None):
             lbl = QLabel(text)
             if fixed_w is not None:
@@ -2335,103 +2592,110 @@ class CongressTracker(QWidget):
             lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
             return lbl
 
-        # Helper to create a 1px high, semi‑transparent separator widget
         def make_separator_item():
-            sep_line = QFrame()
-            sep_line.setFixedHeight(1)
-            sep_line.setStyleSheet("background-color: rgba(255,255,255,0.15); border: none;")
-
+            sep = QFrame()
+            sep.setFixedHeight(1)
+            sep.setStyleSheet("background-color: rgba(255,255,255,0.15); border: none;")
             container = QWidget()
             layout = QHBoxLayout(container)
-            layout.setContentsMargins(8, 1, 8, 1)  # left, top=1, right, bottom=1
-            layout.addWidget(sep_line)
-
+            layout.setContentsMargins(8,1,8,1)
+            layout.addWidget(sep)
             item = QListWidgetItem()
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             item.setSizeHint(container.sizeHint())
             return item, container
 
-        # — Populate SPEECH list —
+        # 5) Populate SPEECH list
         self.speech_list.clear()
-        last_count = None
-        for c in sorted_speakers:
-            # insert separator when speech‐count changes
-            if last_count is not None and c.speeches != last_count:
+        last_s = None
+        for comp in speakers:
+            if last_s is not None and comp.speeches != last_s:
                 sep_item, sep_widget = make_separator_item()
                 self.speech_list.addItem(sep_item)
                 self.speech_list.setItemWidget(sep_item, sep_widget)
 
-            row_item = QListWidgetItem()
-            row_item.setData(Qt.ItemDataRole.UserRole, c.name)
-
-            row_widget = QWidget()
-            row_widget.setStyleSheet("background: transparent;")
-            lo = QHBoxLayout(row_widget)
-            lo.setContentsMargins(8, 4, 8, 4)
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, comp.name)
+            widget = QWidget()
+            widget.setStyleSheet("background: transparent;")
+            lo = QHBoxLayout(widget)
+            lo.setContentsMargins(8,4,8,4)
             lo.setSpacing(6)
             lo.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
-            lo.addWidget(make_label(c.name,              name_w))
-            lo.addWidget(make_label("|",                 marker_w))
-            lo.addWidget(make_label(c.current_side or "—", side_w))  # “Aff” / “Neg”
-            lo.addWidget(make_label("|",                 marker_w))
-            lo.addWidget(make_label("Speeches:",         label_w))
-            lo.addWidget(make_label(str(c.speeches),     count_w))
-            lo.addWidget(make_label("|",                 marker_w))
-            lo.addWidget(make_label("Rank:",             fm.horizontalAdvance("Rank:")))
-            lo.addWidget(make_label(str(c.speech_rank),  rank_w))
+            lo.addWidget(make_label(comp.name, name_w))
+            lo.addWidget(make_label("|", marker_w))
+            lo.addWidget(make_label(comp.current_side or "—", side_w))
+            lo.addWidget(make_label("|", marker_w))
+            lo.addWidget(make_label("Speeches:", label_w))
+            lo.addWidget(make_label(str(comp.speeches), count_w))
+            lo.addWidget(make_label("|", marker_w))
+            lo.addWidget(make_label("Recency:", None))
+            lo.addWidget(make_label(str(comp.speech_rank), None))
 
-            lo.addStretch()  # dump remaining space to the right
+            if in_manual_speech:
+                up = QPushButton("▲")
+                up.setFixedSize(20,20)
+                up.clicked.connect(lambda _, n=comp.name: self.move_competitor(n, -1, 'speech'))
+                down = QPushButton("▼")
+                down.setFixedSize(20,20)
+                down.clicked.connect(lambda _, n=comp.name: self.move_competitor(n, 1, 'speech'))
+                lo.addWidget(up)
+                lo.addWidget(down)
 
-            row_item.setSizeHint(row_widget.sizeHint())
-            self.speech_list.addItem(row_item)
-            self.speech_list.setItemWidget(row_item, row_widget)
+            lo.addStretch()
+            item.setSizeHint(widget.sizeHint())
+            self.speech_list.addItem(item)
+            self.speech_list.setItemWidget(item, widget)
+            last_s = comp.speeches
 
-            last_count = c.speeches
-
-        # — Populate QUESTION list —
+        # 6) Populate QUESTION list
         self.question_list.clear()
         last_q = None
-        for c in sorted_askers:
-            if last_q is not None and c.questions != last_q:
+        for comp in askers:
+            if last_q is not None and comp.questions != last_q:
                 sep_item, sep_widget = make_separator_item()
                 self.question_list.addItem(sep_item)
                 self.question_list.setItemWidget(sep_item, sep_widget)
 
-            row_item = QListWidgetItem()
-            row_item.setData(Qt.ItemDataRole.UserRole, c.name)
-
-            row_widget = QWidget()
-            row_widget.setStyleSheet("background: transparent;")
-            lo = QHBoxLayout(row_widget)
-            lo.setContentsMargins(8, 4, 8, 4)
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, comp.name)
+            widget = QWidget()
+            widget.setStyleSheet("background: transparent;")
+            lo = QHBoxLayout(widget)
+            lo.setContentsMargins(8,4,8,4)
             lo.setSpacing(6)
             lo.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
-            lo.addWidget(make_label(c.name,               name_w))
-            lo.addWidget(make_label("|",                  marker_w))
-            lo.addWidget(make_label("Questions:",         label_w))
-            lo.addWidget(make_label(str(c.questions),     count_w))
-            lo.addWidget(make_label("|",                  marker_w))
-            lo.addWidget(make_label("Rank:",              fm.horizontalAdvance("Rank:")))
-            lo.addWidget(make_label(str(c.question_rank), rank_w))
+            lo.addWidget(make_label(comp.name, name_w))
+            lo.addWidget(make_label("|", marker_w))
+            lo.addWidget(make_label("Questions:", label_w))
+            lo.addWidget(make_label(str(comp.questions), count_w))
+            lo.addWidget(make_label("|", marker_w))
+            lo.addWidget(make_label("Recency:", None))
+            lo.addWidget(make_label(str(comp.question_rank), None))
+
+            if in_manual_question:
+                up = QPushButton("▲")
+                up.setFixedSize(20,20)
+                up.clicked.connect(lambda _, n=comp.name: self.move_competitor(n, -1, 'question'))
+                down = QPushButton("▼")
+                down.setFixedSize(20,20)
+                down.clicked.connect(lambda _, n=comp.name: self.move_competitor(n, 1, 'question'))
+                lo.addWidget(up)
+                lo.addWidget(down)
 
             lo.addStretch()
+            item.setSizeHint(widget.sizeHint())
+            self.question_list.addItem(item)
+            self.question_list.setItemWidget(item, widget)
+            last_q = comp.questions
 
-            row_item.setSizeHint(row_widget.sizeHint())
-            self.question_list.addItem(row_item)
-            self.question_list.setItemWidget(row_item, row_widget)
-
-            last_q = c.questions
-
-        # — Rebuild manage list as before —
+        # 7) Rebuild manage list
         self.manage_list.clear()
         for c in sorted(self.competitors, key=lambda x: x.name.lower()):
             self.manage_list.addItem(c.name)
         self.update_manage_buttons()
-
-
-
 
 
 

@@ -22,33 +22,53 @@ def save_map_state(self):
 
 def load_from_csv(file_path):
     competitors = []
+    history = []
+    
     try:
+        # Load competitors
         with open(file_path, 'r', newline='') as csvfile:
             reader = csv.DictReader(csvfile)
             for row in reader:
                 try:
                     if 'name' not in row:
                         continue
-                    competitor = Competitor(row['name'])
-                    # ...existing attribute loads...
+                    
+                    # Use the from_dict class method to properly reconstruct the competitor
+                    competitor = Competitor.from_dict(row)
                     competitors.append(competitor)
+                    
                 except Exception as e:
                     print(f"Error parsing row {row}: {str(e)}")
                     continue
+        
+        # Load history if it exists
+        history_filepath = file_path.replace('.csv', '_history.json')
+        if os.path.exists(history_filepath):
+            try:
+                with open(history_filepath, 'r', encoding='utf-8') as f:
+                    history_data = json.load(f)
+                    from models import HistoryItem  # Import here to avoid circular imports
+                    history = [HistoryItem.from_dict(item) for item in history_data]
+            except Exception as e:
+                print(f"Error loading history: {str(e)}")
+                
     except Exception as e:
         print(f"Error loading CSV: {str(e)}")
         raise
-    return competitors
-def save_to_csv(filepath, competitors):
+    
+    return competitors, history
+def save_to_csv(filepath, competitors, history=None):
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        
+        # Save competitors
         with open(filepath, 'w', newline='', encoding='utf-8') as file:
             if competitors:
                 fieldnames = [
-                    'name', 
-                    'speeches', 
-                    'questions', 
-                    'last_speech_round', 
+                    'name',
+                    'speeches',
+                    'questions',
+                    'last_speech_round',
                     'last_question_round',
                     'speech_rank',
                     'question_rank',
@@ -65,6 +85,14 @@ def save_to_csv(filepath, competitors):
                     else:
                         data['notes'] = json.dumps({'speeches': [], 'questions': ''})
                     writer.writerow(data)
+        
+        # Save history separately as JSON
+        if history is not None:
+            history_filepath = filepath.replace('.csv', '_history.json')
+            with open(history_filepath, 'w', encoding='utf-8') as f:
+                history_data = [item.to_dict() for item in history]
+                json.dump(history_data, f, indent=2)
+                
     except Exception as e:
         QMessageBox.warning(None, "Save Error", f"Failed to save CSV file: {str(e)}")
 

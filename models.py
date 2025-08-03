@@ -126,5 +126,27 @@ class HistoryItem:
         
     def display_text(self):
         action = "gave speech" if self.action_type == 'speech' else "asked question"
-        details = f" ({self.details})" if self.details else ""
-        return f"{self.timestamp}: {self.competitor_name} {action} (was {self.old_value}, now {self.new_value}){details}"
+        return f"{self.timestamp}: {self.competitor_name} {action} (was {self.old_value}, now {self.new_value})"
+    
+    def to_dict(self):
+        """Convert history item to dictionary for serialization"""
+        return {
+            'action_type': self.action_type,
+            'competitor_name': self.competitor_name,
+            'count_type': self.count_type,
+            'old_value': self.old_value,
+            'new_value': self.new_value,
+            'timestamp': self.timestamp
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        """Create HistoryItem from dictionary"""
+        return cls(
+            action_type=data.get('action_type', ''),
+            competitor_name=data.get('competitor_name', ''),
+            count_type=data.get('count_type', ''),
+            old_value=data.get('old_value', 0),
+            new_value=data.get('new_value', 0),
+            timestamp=data.get('timestamp', '')
+        )
