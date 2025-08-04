@@ -11,6 +11,7 @@ class Competitor:
         self.speech_rank = 0
         self.question_rank = 0
         self.current_side = ""
+        self.resolution_sides = {}
         self.notes = {
             'speeches': [],
             'questions': [],

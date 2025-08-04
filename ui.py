@@ -54,6 +54,7 @@ class CongressTracker(QWidget):
         super().__init__()
         self.load_config()
 
+
         # Window settings
         self.setup_fonts()
         self.setWindowTitle("Congress Tracker")
@@ -67,6 +68,8 @@ class CongressTracker(QWidget):
         self.csv_file_path = None
         self.current_round = 0
         self.history = []
+        self.speech_recency_order = []
+        self.question_recency_order = []
 
         # Resolution system initialization
         self.current_resolution = ""
@@ -85,12 +88,11 @@ class CongressTracker(QWidget):
         self.init_ui()
         self.apply_dark_mode()
         self.setup_timer()
-        self.speech_recency_order = []
-        self.question_recency_order = []
 
         self.update_lists()
 
         # Initial updates
+        self.load_resolution_state_on_startup()
         self.update_status(loaded=False)
         self.timer_checkbox.stateChanged.connect(self.on_timer_toggle)
 
@@ -384,6 +386,61 @@ class CongressTracker(QWidget):
                 self.update_resolution_combos()
             else:
                 QMessageBox.warning(self, "Duplicate", "This resolution already exists.")
+    def load_resolution_state_on_startup(self):
+        """Load resolution state at startup and determine next speaker from history"""
+        if not self.resolution_list:
+            self.set_current_resolution("")
+            return
+            
+        # If we have a current resolution, use it; otherwise use the first one
+        if not self.current_resolution and self.resolution_list:
+            self.current_resolution = self.resolution_list[0]
+            self.current_side = "Affirmative"
+        
+        # FIX: Determine the next speaker based on speech history for this resolution
+        if self.current_resolution:
+            # Get all speeches for this resolution, sorted by timestamp
+            all_resolution_speeches = []
+            for c in self.competitors:
+                if hasattr(c, 'notes') and 'speeches' in c.notes:
+                    for speech in c.notes['speeches']:
+                        if isinstance(speech, dict) and speech.get('resolution') == self.current_resolution:
+                            speech_with_name = speech.copy()
+                            speech_with_name['competitor_name'] = c.name
+                            all_resolution_speeches.append(speech_with_name)
+            
+            # Sort by timestamp to find the most recent speech
+            all_resolution_speeches.sort(key=lambda x: x.get('timestamp', ''))
+            
+            if all_resolution_speeches:
+                # Get the side of the most recent speech
+                last_speech_side = all_resolution_speeches[-1].get('side', 'Aff')
+                # Next speaker should be the opposite side
+                if last_speech_side == 'Aff':
+                    self.current_side = "Negative"
+                else:
+                    self.current_side = "Affirmative"
+            else:
+                # No speeches yet, start with Affirmative
+                self.current_side = "Affirmative"
+        
+        # Load competitor sides for this resolution
+        for c in self.competitors:
+            if self.current_resolution in c.resolution_sides:
+                c.current_side = c.resolution_sides[self.current_resolution]
+            elif hasattr(c, 'notes') and 'speeches' in c.notes:
+                # Determine side from speech history
+                resolution_speeches = [s for s in c.notes['speeches'] 
+                                    if isinstance(s, dict) and s.get('resolution') == self.current_resolution]
+                if resolution_speeches:
+                    c.current_side = resolution_speeches[-1].get('side', '')
+                    c.resolution_sides[self.current_resolution] = c.current_side
+                else:
+                    c.current_side = ""
+            else:
+                c.current_side = ""
+        
+        self.set_current_resolution(self.current_resolution)
     
     def load_resolution_state(self):
         """Load resolution state at startup"""
@@ -393,34 +450,54 @@ class CongressTracker(QWidget):
             self.set_current_resolution("")
 
     def move_competitor(self, name, direction, list_type):
-        '''Move competitor up (-1) or down (+1) in the given recency list.'''
-        order = self.speech_recency_order if list_type=='speech' else self.question_recency_order
-        idx = order.index(name)
-        new_idx = idx + direction
-        if 0 <= new_idx < len(order):
-            order[idx], order[new_idx] = order[new_idx], order[idx]
-            self.update_lists()
+        """Move competitor up (-1) or down (+1) in the given recency list, and update rank in model."""
+        order = self.speech_recency_order if list_type == 'speech' else self.question_recency_order
 
+        try:
+            idx = order.index(name)
+            new_idx = idx + direction
+            if 0 <= new_idx < len(order):
+                order[idx], order[new_idx] = order[new_idx], order[idx]
+
+                # Update rank in each Competitor
+                for i, n in enumerate(order):
+                    comp = next((c for c in self.competitors if c.name == n), None)
+                    if comp:
+                        if list_type == 'speech':
+                            comp.speech_rank = i + 1
+                        else:
+                            comp.question_rank = i + 1
+
+                self.update_lists()
+                self.save_to_csv()  # This will now save the recency orders too!
+        except ValueError:
+            print(f"Competitor {name} not found in {list_type} list.")
     def next_resolution(self):
-            if not self.resolution_list:
-                return
-                
-            current_idx = self.resolution_list.index(self.current_resolution) if self.current_resolution in self.resolution_list else -1
-            next_idx = (current_idx + 1) % len(self.resolution_list)
-            self.current_resolution = self.resolution_list[next_idx]
+        if not self.resolution_list:
+            return
             
-            # Reset all competitor sides
-            for c in self.competitors:
+        current_idx = self.resolution_list.index(self.current_resolution) if self.current_resolution in self.resolution_list else -1
+        next_idx = (current_idx + 1) % len(self.resolution_list)
+        self.current_resolution = self.resolution_list[next_idx]
+        
+        # FIXED: Always reset to Affirmative (not based on current side)
+        self.current_side = "Affirmative"
+        
+        # Load saved sides for this resolution or clear if new resolution
+        for c in self.competitors:
+            if self.current_resolution in c.resolution_sides:
+                # Restore the saved side for this resolution
+                c.current_side = c.resolution_sides[self.current_resolution]
+            else:
+                # Clear side for new resolution
                 c.current_side = ""
-            
-            # Reset to Affirmative side
-            self.current_side = "Affirmative"
-            
-            # Update UI - this was missing the proper UI updates
-            self.set_current_resolution(self.current_resolution)
-            self.update_resolution_display()  # Make sure all UI elements are updated
-            self.update_lists()
-            self.save_to_csv()
+        
+        # Update UI
+        self.set_current_resolution(self.current_resolution)
+        self.update_resolution_display()
+        self.update_lists()
+        self.save_to_csv()
+
 
     def remove_resolution(self):
         selected = self.resolution_list_widget.currentItem()
@@ -443,25 +520,30 @@ class CongressTracker(QWidget):
                 self.update_resolution_combos()
 
     def update_resolution_display(self):
-        """Update all resolution-related UI elements"""
-        # Update resolution label
-        if hasattr(self, 'current_resolution_label'):
-            resolution_text = f"Resolution: {self.current_resolution}" if self.current_resolution else "Resolution: None"
-            self.current_resolution_label.setText(resolution_text)
-        
-        # Update next speaker display
-        if hasattr(self, 'next_speaker_label'):
-            side_text = f"Next Speaker: {'Aff' if self.current_side == 'Affirmative' else 'Neg'}"
-            self.next_speaker_label.setText(side_text)
-        
-        # Update side indicator
-        if hasattr(self, 'side_indicator'):
+        """Update all resolution-related UI elements safely."""
+        # 1) Resolution label (Speech tab)
+        if hasattr(self, 'current_resolution_label') and self.current_resolution_label:
+            res_text = f"Resolution: {self.current_resolution}" if self.current_resolution else "Resolution: None"
+            self.current_resolution_label.setText(res_text)
+
+        # 2) Next speaker label (Speech tab)
+        if hasattr(self, 'next_speaker_label') and self.next_speaker_label:
+            side_abbrev = "Aff" if self.current_side == "Affirmative" else "Neg"
+            self.next_speaker_label.setText(f"Next Speaker: {side_abbrev}")
+
+        # 3) Side indicator (in the input container)
+        if hasattr(self, 'side_indicator') and self.side_indicator:
             self.side_indicator.setText("Aff" if self.current_side == "Affirmative" else "Neg")
-        if hasattr(self, 'q_current_resolution_label'):
-            self.q_current_resolution_label.setText(f"Resolution: {self.current_resolution or 'None'}")
-        if hasattr(self, 'q_next_speaker_label'):
-            abbr = "Aff" if self.current_side=="Affirmative" else "Neg"
-            self.q_next_speaker_label.setText(f"Next Speaker: {abbr}")
+
+        # 4) Question tab resolution label - FIX: Update question tab labels too
+        if hasattr(self, 'q_current_resolution_label') and self.q_current_resolution_label:
+            res_text = f"Resolution: {self.current_resolution}" if self.current_resolution else "Resolution: None"
+            self.q_current_resolution_label.setText(res_text)
+            
+        # 5) Question tab next speaker label - FIX: Update question tab next speaker
+        if hasattr(self, 'q_next_speaker_label') and self.q_next_speaker_label:
+            side_abbrev = "Aff" if self.current_side == "Affirmative" else "Neg"
+            self.q_next_speaker_label.setText(f"Next Speaker: {side_abbrev}")
 
     def get_speech_duration(self):
         """Calculate speech duration from input fields"""
@@ -574,23 +656,7 @@ class CongressTracker(QWidget):
         
         return file_path
 
-    def update_resolution_display(self):
-        """Update all resolution-related UI elements safely."""
-        # 1) Resolution label
-        if hasattr(self, 'current_resolution_label') and self.current_resolution_label:
-            res_text = f"Resolution: {self.current_resolution}" if self.current_resolution else "Resolution: None"
-            self.current_resolution_label.setText(res_text)
 
-        # 2) Next speaker label
-        if hasattr(self, 'next_speaker_label') and self.next_speaker_label:
-            side_abbrev = "Aff" if self.current_side == "Affirmative" else "Neg"
-            self.next_speaker_label.setText(f"Next Speaker: {side_abbrev}")
-
-        # 3) Side indicator (in the input container)
-        if hasattr(self, 'side_indicator') and self.side_indicator:
-            self.side_indicator.setText("Aff" if self.current_side == "Affirmative" else "Neg")
-
-        # If you also have other widgets (e.g. a smaller header elsewhere), guard them similarly.
 
 
     def setup_timer(self):
@@ -792,7 +858,16 @@ class CongressTracker(QWidget):
             return
             
         try:
-            persistence.save_to_csv(self.csv_file_path, self.competitors, self.history)
+            persistence.save_to_csv(
+                self.csv_file_path, 
+                self.competitors, 
+                self.history,
+                self.speech_recency_order,
+                self.question_recency_order,
+                self.resolution_list,  # Add resolutions
+                self.current_resolution,  # Add current resolution
+                self.current_side  # Add current side
+            )
         except Exception as e:
             print(f"Error saving CSV: {e}")
 
@@ -922,17 +997,25 @@ class CongressTracker(QWidget):
     def set_current_resolution(self, resolution):
         """Set and display the current resolution"""
         self.current_resolution = resolution
+        
+        # Load saved sides for this resolution
+        for c in self.competitors:
+            if resolution in c.resolution_sides:
+                c.current_side = c.resolution_sides[resolution]
+            else:
+                c.current_side = ""
+        
         if resolution:
-            # Update main resolution label
-            self.current_resolution_label.setText(f"Resolution: {resolution}")
             # Update settings panel label
             if hasattr(self, 'resolution_settings_label'):
                 self.resolution_settings_label.setText(f"Current: {resolution}")
         else:
-            self.current_resolution_label.setText("Resolution: None")
             if hasattr(self, 'resolution_settings_label'):
                 self.resolution_settings_label.setText("Current: None")
-        self.save_to_csv()  # Persist the change
+        
+        # FIX: Make sure to update all resolution displays
+        self.update_resolution_display()
+        self.save_to_csv()
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.Resize and hasattr(self, 'timer_container'):
@@ -1518,7 +1601,7 @@ class CongressTracker(QWidget):
                 timed_speeches = [s for s in res_speeches if s.get('duration', 0) > 0]
 
                 total_time = sum(s['duration'] for s in timed_speeches)
-                speech_count = len(timed_speeches)
+                speech_count = len([s for s in res_speeches if s.get('duration', 0) >= 0])
 
                 if speech_count > 0:
                     avg_seconds = total_time // speech_count
@@ -1706,15 +1789,34 @@ class CongressTracker(QWidget):
         next_idx = (current_idx + 1) % len(self.resolution_list)
         self.current_resolution = self.resolution_list[next_idx]
         
-        # Reset all competitor sides
-        for c in self.competitors:
-            c.current_side = ""
-        
-        # Reset to Affirmative side
+        # FIXED: Always reset to Affirmative (not based on current side)
         self.current_side = "Affirmative"
+        
+        # FIX: Load saved sides for this resolution OR determine from speech history
+        for c in self.competitors:
+            if self.current_resolution in c.resolution_sides:
+                # Restore the saved side for this resolution
+                c.current_side = c.resolution_sides[self.current_resolution]
+            else:
+                # FIX: Check if they have speeches for this resolution and determine side
+                if hasattr(c, 'notes') and 'speeches' in c.notes:
+                    resolution_speeches = [s for s in c.notes['speeches'] 
+                                        if isinstance(s, dict) and s.get('resolution') == self.current_resolution]
+                    if resolution_speeches:
+                        # Use the most recent side they spoke on for this resolution
+                        c.current_side = resolution_speeches[-1].get('side', '')
+                        # Save this side for future reference
+                        c.resolution_sides[self.current_resolution] = c.current_side
+                    else:
+                        # Clear side for new resolution
+                        c.current_side = ""
+                else:
+                    # Clear side for new resolution
+                    c.current_side = ""
         
         # Update UI
         self.set_current_resolution(self.current_resolution)
+        self.update_resolution_display()
         self.update_lists()
         self.save_to_csv()
 
@@ -2046,19 +2148,31 @@ border: 1px solid #444;
         if file_path:
             try:
                 self.csv_file_path = file_path
-                loaded_competitors, loaded_history = persistence.load_from_csv(self.csv_file_path)
+                # Updated to receive resolutions
+                loaded_competitors, loaded_history, speech_recency, question_recency, resolution_list, current_resolution, current_side = persistence.load_from_csv(self.csv_file_path)
                 
                 if not loaded_competitors:
                     QMessageBox.warning(self, "Error", "The CSV file is empty or couldn't be parsed.")
                     return
                 
                 self.competitors = loaded_competitors
-                self.history = loaded_history  # Load the history
+                self.history = loaded_history
+                
+                # Load the recency orders
+                self.speech_recency_order = speech_recency
+                self.question_recency_order = question_recency
+                
+                # Load resolution data
+                self.resolution_list = resolution_list or []
+                self.current_resolution = current_resolution or ""
+                self.current_side = current_side or "Affirmative"
                 
                 # Initialize missing attributes for backward compatibility
                 for c in self.competitors:
                     if not hasattr(c, 'current_side'):
                         c.current_side = ""
+                    if not hasattr(c, 'resolution_sides'):
+                        c.resolution_sides = {}
                     if not hasattr(c, 'notes'):
                         c.notes = {}
                     if not hasattr(c, 'last_speech_round'):
@@ -2069,10 +2183,6 @@ border: 1px solid #444;
                 max_speech_round = max((c.last_speech_round for c in self.competitors), default=0)
                 max_question_round = max((c.last_question_round for c in self.competitors), default=0)
                 self.current_round = max(max_speech_round, max_question_round)
-                
-                # Initialize recency orders and tracking state
-                self.speech_recency_order = [c.name for c in self.competitors]
-                self.question_recency_order = [c.name for c in self.competitors]
                 
                 # Check if any competitor has logged speeches/questions to determine manual mode
                 has_speeches = any(c.speeches > 0 for c in self.competitors)
@@ -2086,9 +2196,12 @@ border: 1px solid #444;
                 # Mark as tracking started
                 self.tracking_started = True
                 
+                # FIX: Load resolution state with proper next speaker determination
+                self.load_resolution_state_on_startup()
+                
                 self.update_lists()
                 self.update_all_ui_post_start()
-                self.update_history_tab()  # Update history display
+                self.update_history_tab()
                 self.update_status(loaded=True, filepath=file_path)
                 self.update_tab_indicators()
                 
@@ -2385,8 +2498,12 @@ border: 1px solid #444;
         # 3a) Capture old count
         old_count = competitor.speeches
 
-        # 3b) Log the speech
+        # 3b) Set and save the side for this resolution
         competitor.current_side = side
+        if self.current_resolution:
+            competitor.resolution_sides[self.current_resolution] = side
+
+        # 3c) Log the speech
         competitor.add_speech(
             round_num=self.current_round,
             side=side,
@@ -2394,10 +2511,10 @@ border: 1px solid #444;
             resolution=self.current_resolution
         )
 
-        # 3c) Capture new count
+        # 3d) Capture new count
         new_count = competitor.speeches
 
-        # 3d) Record in history
+        # 3e) Record in history
         self.log_history(
             action_type='speech',
             competitor_name=competitor.name,
@@ -2417,7 +2534,7 @@ border: 1px solid #444;
         self.save_to_csv()
         self.update_stats_display()
 
-        # 6) Reset speech‐logging UI
+        # 6) Reset speech‑logging UI
         self.speech_name_input.setMaximumWidth(16777215)
         self.speech_name_input.setCurrentText("")
         self.speech_log_button.setText("Log Speech")
@@ -2427,7 +2544,7 @@ border: 1px solid #444;
         self.speech_list.clearSelection()
         self.speech_input_container.setVisible(False)
 
-        # FIX #1: Clear the time inputs after logging
+        # Clear the time inputs after logging
         self.minutes_input.clear()
         self.seconds_input.clear()
 
@@ -2529,6 +2646,14 @@ border: 1px solid #444;
                 if c.name == old_name:
                     c.name = new_name
                     break
+            
+            # Update recency orders
+            if old_name in self.speech_recency_order:
+                idx = self.speech_recency_order.index(old_name)
+                self.speech_recency_order[idx] = new_name
+            if old_name in self.question_recency_order:
+                idx = self.question_recency_order.index(old_name)
+                self.question_recency_order[idx] = new_name
                     
             # Update all lists and UI
             self.update_lists()
@@ -2550,27 +2675,55 @@ border: 1px solid #444;
         in_manual_question = self.manual_reordering_question_enabled
 
         # 3) Build ordered lists
-        # Speech order: manual uses preserved list, else sort by count/recency
+        # Speech order: ALWAYS use preserved recency order as base, then sort by count within groups
+        temp = {c.name: c for c in self.competitors}
+        
         if in_manual_speech:
-            temp = {c.name: c for c in self.competitors}
+            # Pure manual mode - use exact recency order
             speakers = [temp[name] for name in self.speech_recency_order if name in temp]
         else:
-            speakers = sorted(
-                self.competitors,
-                key=lambda c: (c.speeches, -(self.current_round - (c.last_speech_round or 0)))
-            )
+            # Automatic mode - preserve recency order within each speech count group
+            # Group competitors by speech count
+            speech_groups = {}
+            for comp in self.competitors:
+                count = comp.speeches
+                if count not in speech_groups:
+                    speech_groups[count] = []
+                speech_groups[count].append(comp)
+            
+            # Sort each group by recency order (preserve manual ordering within groups)
+            speakers = []
+            for count in sorted(speech_groups.keys()):
+                group = speech_groups[count]
+                # Sort this group by recency order (lower index = higher priority)
+                group_sorted = sorted(group, key=lambda c: self.speech_recency_order.index(c.name) 
+                                    if c.name in self.speech_recency_order else float('inf'))
+                speakers.extend(group_sorted)
+        
         for idx, comp in enumerate(speakers, start=1):
             comp.speech_rank = idx
 
-        # Question order: manual vs automatic
+        # Question order: same logic
         if in_manual_question:
-            temp_q = {c.name: c for c in self.competitors}
-            askers = [temp_q[name] for name in self.question_recency_order if name in temp_q]
+            # Pure manual mode - use exact recency order
+            askers = [temp[name] for name in self.question_recency_order if name in temp]
         else:
-            askers = sorted(
-                self.competitors,
-                key=lambda c: (c.questions, -(self.current_round - (c.last_question_round or 0)))
-            )
+            # Automatic mode - preserve recency order within each question count group
+            question_groups = {}
+            for comp in self.competitors:
+                count = comp.questions
+                if count not in question_groups:
+                    question_groups[count] = []
+                question_groups[count].append(comp)
+            
+            # Sort each group by recency order
+            askers = []
+            for count in sorted(question_groups.keys()):
+                group = question_groups[count]
+                group_sorted = sorted(group, key=lambda c: self.question_recency_order.index(c.name) 
+                                    if c.name in self.question_recency_order else float('inf'))
+                askers.extend(group_sorted)
+                
         for idx, comp in enumerate(askers, start=1):
             comp.question_rank = idx
 
@@ -2718,6 +2871,9 @@ border: 1px solid #444;
                 self.update_lists()
                 self.save_to_csv()
 
+
+
+
     def delete_competitor(self):
         selected_items = self.manage_list.selectedItems()
         if not selected_items:
@@ -2732,6 +2888,13 @@ border: 1px solid #444;
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.competitors = [c for c in self.competitors if c.name != name_to_delete]
+            
+            # Remove from recency orders
+            if name_to_delete in self.speech_recency_order:
+                self.speech_recency_order.remove(name_to_delete)
+            if name_to_delete in self.question_recency_order:
+                self.question_recency_order.remove(name_to_delete)
+                
             self.update_competitor_combos()
             self.update_lists()
             self.save_to_csv()
@@ -2747,6 +2910,11 @@ border: 1px solid #444;
             c.last_speech_round = 0
             c.last_question_round = 0
             self.competitors.append(c)
+            
+            # Add to recency orders
+            self.speech_recency_order.append(new_name)
+            self.question_recency_order.append(new_name)
+            
             self.update_competitor_combos()
             self.update_lists()
             self.save_to_csv()
