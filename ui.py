@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QGroupBox, QSpinBox, QScrollArea, QFrame, QMenu, QTextEdit, QDialog
 )
 from PyQt6.QtCore import Qt, QPropertyAnimation, QPoint, QTimer, QSize, QModelIndex, QParallelAnimationGroup
-from PyQt6.QtGui import QColor, QPalette, QFont
+from PyQt6.QtGui import QColor, QPalette, QFont, QKeySequence, QShortcut, QAction
 from models import Competitor, HistoryItem
 import persistence
 from PyQt6.QtWidgets import QTabBar, QCheckBox, QStylePainter, QStyleOptionTab, QStyle, QSizePolicy, QTableWidget, QHeaderView, QTableWidgetItem
@@ -90,6 +90,7 @@ class CongressTracker(QWidget):
         self.setup_timer()
 
         self.update_lists()
+        self.setup_keyboard_shortcuts()
 
         # Initial updates
         self.load_resolution_state_on_startup()
@@ -664,6 +665,8 @@ class CongressTracker(QWidget):
         self.timer.timeout.connect(self.update_timer)
         self.start_time = None
         self.elapsed_seconds = 0
+        self.is_paused = False
+        self.pause_start_time = None
 
         # Timer container exposed for resize detection
         self.timer_container = QWidget()
@@ -702,32 +705,29 @@ class CongressTracker(QWidget):
                 QPushButton:pressed {{ background: {press}; }}
             """)
 
-        # Timer buttons
-        self.start_timer_button = QPushButton("▶")
-        style_btn(self.start_timer_button, "#2e7d32", "#66bb6a", "#1b5e20")
-
-        self.stop_timer_button = QPushButton("■")
-        style_btn(self.stop_timer_button, "#c62828", "#e57373", "#8e0000")
-
-        self.reset_timer_button = QPushButton("↺")
-        style_btn(self.reset_timer_button, "#1565c0", "#5e92f3", "#0d47a1")
-
         # Group buttons in a container to better control layout width
         button_container = QWidget()
         button_layout = QHBoxLayout(button_container)
         button_layout.setContentsMargins(0, 0, 0, 0)
         button_layout.setSpacing(8)
-        button_layout.addWidget(self.start_timer_button)
-        button_layout.addWidget(self.stop_timer_button)
+
+        # Start/Pause button (changes between play and pause)
+        self.start_pause_button = QPushButton("▶")
+        style_btn(self.start_pause_button, "#2e7d32", "#66bb6a", "#1b5e20")
+        button_layout.addWidget(self.start_pause_button)
+
+        # Reset button
+        self.reset_timer_button = QPushButton("↺")
+        style_btn(self.reset_timer_button, "#1565c0", "#5e92f3", "#0d47a1")
         button_layout.addWidget(self.reset_timer_button)
+
         button_container.setMaximumWidth(int(self.width() * 0.4))
         timer_layout.addWidget(button_container)
 
         self.layout.addWidget(self.timer_container)
 
         # Connect buttons
-        self.start_timer_button.clicked.connect(self.start_timer)
-        self.stop_timer_button.clicked.connect(self.stop_timer)
+        self.start_pause_button.clicked.connect(self.toggle_timer_state)
         self.reset_timer_button.clicked.connect(self.reset_timer)
 
         # Timer flashing setup
@@ -738,6 +738,18 @@ class CongressTracker(QWidget):
         # Initial visibility setup
         self.update_timer_visibility()
 
+
+    def toggle_timer_state(self):
+        """Toggle between start, pause, and resume states"""
+        if not self.timer.isActive() and not self.is_paused:
+            # Start the timer
+            self.start_timer()
+        elif self.timer.isActive() and not self.is_paused:
+            # Pause the timer
+            self.pause_timer()
+        elif self.is_paused:
+            # Resume the timer
+            self.resume_timer()
 
     def toggle_flash(self):
         """Toggle between red and normal background for 0-second flashing"""
@@ -771,26 +783,113 @@ class CongressTracker(QWidget):
         """Update visibility based on current config"""
         visible = self.config.get('enable_timer', True)
         self.timer_label.setVisible(visible)
-        self.start_timer_button.setVisible(visible)
-        self.stop_timer_button.setVisible(visible)
+        self.start_pause_button.setVisible(visible)
         self.reset_timer_button.setVisible(visible)
         # Update checkbox to match
         self.timer_checkbox.setChecked(visible)
-
     def start_timer(self):
+        """Start the timer from the beginning"""
         self.start_time = datetime.datetime.now()
+        self.elapsed_seconds = 0
+        self.is_paused = False
+        self.pause_start_time = None
         self.timer.start(1000)
-
+        self.start_pause_button.setText("⏸")  # Pause symbol
+        self.start_pause_button.setStyleSheet("""
+            QPushButton {
+                background: #f57c00;
+                color: white;
+                border: none;
+                padding: 0 12px;
+                font-size: 16px;
+                border-radius: 4px;
+                max-width: 120px;
+            }
+            QPushButton:hover { background: #ff9800; }
+            QPushButton:pressed { background: #e65100; }
+        """)
+    def pause_timer(self):
+        """Pause the timer"""
+        if self.timer.isActive():
+            self.timer.stop()
+            self.pause_start_time = datetime.datetime.now()
+            self.is_paused = True
+            self.flash_timer.stop()  # Stop flashing when paused
+            self.start_pause_button.setText("▶")  # Play symbol
+            self.start_pause_button.setStyleSheet("""
+                QPushButton {
+                    background: #2e7d32;
+                    color: white;
+                    border: none;
+                    padding: 0 12px;
+                    font-size: 16px;
+                    border-radius: 4px;
+                    max-width: 120px;
+                }
+                QPushButton:hover { background: #66bb6a; }
+                QPushButton:pressed { background: #1b5e20; }
+            """)
+    def resume_timer(self):
+        """Resume the timer from where it was paused"""
+        if self.is_paused and self.pause_start_time:
+            # Calculate how long we were paused and adjust start time
+            pause_duration = datetime.datetime.now() - self.pause_start_time
+            self.start_time += pause_duration
+            
+            self.is_paused = False
+            self.pause_start_time = None
+            self.timer.start(1000)
+            self.start_pause_button.setText("⏸")  # Pause symbol
+            self.start_pause_button.setStyleSheet("""
+                QPushButton {
+                    background: #f57c00;
+                    color: white;
+                    border: none;
+                    padding: 0 12px;
+                    font-size: 16px;
+                    border-radius: 4px;
+                    max-width: 120px;
+                }
+                QPushButton:hover { background: #ff9800; }
+                QPushButton:pressed { background: #e65100; }
+            """)
     def stop_timer(self):
         self.timer.stop()
         self.flash_timer.stop()  # Stop flashing when timer is stopped
 
     def reset_timer(self):
+        """Reset the timer to initial state"""
         self.timer.stop()
         self.flash_timer.stop()  # Stop flashing when timer is reset
         self.start_time = None
         self.elapsed_seconds = 0
-        self.timer_label.setText("00:00")
+        self.is_paused = False
+        self.pause_start_time = None
+        
+        # Reset display
+        if self.config['timer_mode'] == 'countdown':
+            mins = self.config['speech_time_limit'] // 60
+            secs = self.config['speech_time_limit'] % 60
+            self.timer_label.setText(f"{mins:02}:{secs:02}")
+        else:
+            self.timer_label.setText("00:00")
+        
+        # Reset button to start state
+        self.start_pause_button.setText("▶")
+        self.start_pause_button.setStyleSheet("""
+            QPushButton {
+                background: #2e7d32;
+                color: white;
+                border: none;
+                padding: 0 12px;
+                font-size: 16px;
+                border-radius: 4px;
+                max-width: 120px;
+            }
+            QPushButton:hover { background: #66bb6a; }
+            QPushButton:pressed { background: #1b5e20; }
+        """)
+        
         # Reset to normal style
         self.timer_label.setStyleSheet("""
             QLabel {
@@ -1414,6 +1513,55 @@ class CongressTracker(QWidget):
         self.timer_group.setLayout(timer_layout)
         self.timer_group.setVisible(False)
         self.manage_layout.addWidget(self.timer_group)
+
+# Accessibility settings toggle
+        self.accessibility_toggle = QPushButton("▼ Accessibility Settings")
+        self.accessibility_toggle.setCheckable(True)
+        self.accessibility_toggle.setChecked(False)
+        self.accessibility_toggle.clicked.connect(self.toggle_accessibility_settings)
+        self.manage_layout.addWidget(self.accessibility_toggle)
+
+        # Accessibility settings group (initially hidden)
+        self.accessibility_group = QGroupBox()
+        accessibility_layout = QVBoxLayout()
+
+        # Keyboard shortcuts checkbox
+        self.shortcuts_checkbox = QCheckBox("Enable Keyboard Shortcuts")
+        self.shortcuts_checkbox.setChecked(self.config.get('enable_shortcuts', True))
+        accessibility_layout.addWidget(self.shortcuts_checkbox)
+        
+        # Add shortcut help text
+        shortcuts_help = QLabel("""
+Keyboard Shortcuts:
+• Space: Start/Stop Timer
+• Ctrl+S: Quick Log Speech (first person)
+• Ctrl+Q: Quick Log Question (first person) 
+• Ctrl+Tab: Next Tab
+• Ctrl+Shift+Tab: Previous Tab
+• R: Reset Timer
+        """)
+        shortcuts_help.setStyleSheet("font-size: 11px; color: #AAAAAA; margin-left: 20px;")
+        shortcuts_help.setWordWrap(True)
+        accessibility_layout.addWidget(shortcuts_help)
+
+        # High contrast checkbox
+        self.high_contrast_checkbox = QCheckBox("High Contrast Mode")
+        self.high_contrast_checkbox.setChecked(self.config.get('high_contrast', False))
+        accessibility_layout.addWidget(self.high_contrast_checkbox)
+
+        # Large text checkbox
+        self.large_text_checkbox = QCheckBox("Large Text Mode")
+        self.large_text_checkbox.setChecked(self.config.get('large_text', False))
+        accessibility_layout.addWidget(self.large_text_checkbox)
+
+        # Save accessibility settings button
+        save_accessibility_btn = QPushButton("Save Accessibility Settings")
+        save_accessibility_btn.clicked.connect(self.save_accessibility_settings)
+        accessibility_layout.addWidget(save_accessibility_btn)
+
+        self.accessibility_group.setLayout(accessibility_layout)
+        self.accessibility_group.setVisible(False)
+        self.manage_layout.addWidget(self.accessibility_group)
 
         settings_scroll.setWidget(settings_container)
         self.tabs.addTab(settings_scroll, "Settings")
@@ -2088,7 +2236,10 @@ border: 1px solid #444;
             'enable_timer': True,
             'speech_time_limit': 180,  # 3 minutes
             'time_signals': [60, 30, 10],  # Signal points in seconds
-            'timer_mode': 'countdown'  # or 'stopwatch'
+            'timer_mode': 'countdown',  # or 'stopwatch'
+            'enable_shortcuts': True,
+            'high_contrast': False,
+            'large_text': False
         }
 
         # Set up config directory
@@ -2923,6 +3074,239 @@ border: 1px solid #444;
         selected = bool(self.manage_list.selectedItems())
         self.rename_button.setEnabled(selected)
         self.delete_button.setEnabled(selected)
+    def setup_keyboard_shortcuts(self):
+        """Set up keyboard shortcuts"""
+        if not self.config.get('enable_shortcuts', True):
+            return
+        
+        # Timer shortcuts
+        self.start_timer_shortcut = QShortcut(QKeySequence("Space"), self)
+        self.start_timer_shortcut.activated.connect(self.toggle_timer)
+        
+        self.reset_timer_shortcut = QShortcut(QKeySequence("Ctrl+R"), self)
+        self.reset_timer_shortcut.activated.connect(self.reset_timer)
+        
+        # Speech logging shortcuts
+        self.log_speech_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.log_speech_shortcut.activated.connect(self.quick_log_speech)
+        
+        # Question logging shortcuts  
+        self.log_question_shortcut = QShortcut(QKeySequence("Ctrl+Q"), self)
+        self.log_question_shortcut.activated.connect(self.quick_log_question)
+        
+        # Navigation shortcuts
+        self.next_tab_shortcut = QShortcut(QKeySequence("Ctrl+Tab"), self)
+        self.next_tab_shortcut.activated.connect(self.next_tab)
+        
+        self.prev_tab_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Tab"), self)
+        self.prev_tab_shortcut.activated.connect(self.prev_tab)
+
+    def toggle_timer(self):
+        """Toggle timer start/pause/resume with spacebar (for keyboard shortcut)"""
+        self.toggle_timer_state()
+
+    def quick_log_speech(self):
+        """Quick log speech for first person in speech list"""
+        if not self.tracking_started or self.speech_list.count() == 0:
+            return
+        
+        # Get first item that's not a separator
+        first_item = None
+        for i in range(self.speech_list.count()):
+            item = self.speech_list.item(i)
+            if item.flags() & Qt.ItemFlag.ItemIsSelectable:
+                first_item = item
+                break
+        
+        if first_item:
+            self.on_speech_list_double_clicked(first_item)
+
+    def quick_log_question(self):
+        """Quick log question for first person in question list"""
+        if not self.tracking_started or self.question_list.count() == 0:
+            return
+        
+        # Get first item that's not a separator
+        first_item = None
+        for i in range(self.question_list.count()):
+            item = self.question_list.item(i)
+            if item.flags() & Qt.ItemFlag.ItemIsSelectable:
+                first_item = item
+                break
+        
+        if first_item:
+            self.on_question_list_double_clicked(first_item)
+
+    def next_tab(self):
+        """Go to next tab"""
+        current = self.tabs.currentIndex()
+        next_index = (current + 1) % self.tabs.count()
+        self.tabs.setCurrentIndex(next_index)
+
+    def prev_tab(self):
+        """Go to previous tab"""
+        current = self.tabs.currentIndex()
+        prev_index = (current - 1) % self.tabs.count()
+        self.tabs.setCurrentIndex(prev_index)
+
+    def apply_accessibility_settings(self):
+        """Apply accessibility settings like high contrast and large text"""
+        base_font_size = 13
+        if self.config.get('large_text', False):
+            base_font_size = 16
+        
+        if self.config.get('high_contrast', False):
+            # High contrast dark theme
+            qss = f"""
+            QWidget, QLineEdit, QComboBox, QTextEdit {{
+                background: #000000;
+                color: #FFFFFF;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: {base_font_size}px;
+                font-weight: bold;
+            }}
+            
+            QTabWidget::pane, QGroupBox {{
+                background: #1A1A1A;
+                border: 2px solid #FFFFFF;
+            }}
+            
+            QTabBar::tab {{
+                background: #000000;
+                color: #FFFFFF;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border: 2px solid #FFFFFF;
+                font-weight: bold;
+            }}
+            QTabBar::tab:hover {{
+                background: #333333;
+            }}
+            QTabBar::tab:selected {{
+                background: #FFFFFF;
+                color: #000000;
+            }}
+            
+            QListWidget, QLineEdit, QComboBox, QTextEdit {{
+                background: #000000;
+                border: 2px solid #FFFFFF;
+                color: #FFFFFF;
+                padding: 6px;
+                font-size: {base_font_size}px;
+                font-weight: bold;
+            }}
+            
+            QListWidget::item:hover {{
+                background: #444444;
+            }}
+            QListWidget::item:selected {{
+                background: #FFFFFF;
+                color: #000000;
+            }}
+            
+            QPushButton {{
+                background: #000000;
+                color: #FFFFFF;
+                border: 2px solid #FFFFFF;
+                padding: 8px 16px;
+                font-size: {base_font_size}px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background: #FFFFFF;
+                color: #000000;
+            }}
+            QPushButton:pressed {{
+                background: #CCCCCC;
+                color: #000000;
+            }}
+            
+            QLabel {{
+                color: #FFFFFF;
+                font-size: {base_font_size}px;
+                font-weight: bold;
+            }}
+            """
+        else:
+            # Regular dark theme with size adjustment
+            qss = f"""
+            QWidget, QLineEdit, QComboBox, QTextEdit {{
+                background: #2D2D2D;
+                color: #E0E0E0;
+                font-family: 'Segoe UI', Arial, sans-serif;
+                font-size: {base_font_size}px;
+            }}
+
+            QTabWidget::pane, QGroupBox {{
+                background: #3A3A3A;
+                border: 1px solid #444;
+            }}
+            QGroupBox {{
+                margin-top: 10px;
+                padding-top: 15px;
+            }}
+            QGroupBox::title {{
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 3px;
+            }}
+
+            QTabBar::tab {{
+                background: #3A3A3A;
+                color: #BBBBBB;
+                padding: 8px 16px;
+                margin-right: 2px;
+                border: 1px solid #444;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+            }}
+            QTabBar::tab:hover {{
+                background: #454545;
+            }}
+            QTabBar::tab:selected {{
+                background: #505050;
+                color: #FFFFFF;
+                border-bottom-color: #6D9EEB;
+            }}
+
+            QListWidget, QLineEdit, QComboBox, QTextEdit {{
+                background: #3A3A3A;
+                border: 1px solid #444;
+                padding: 4px;
+                font-size: {base_font_size}px;
+            }}
+            QListWidget {{
+                border-radius: 4px;
+            }}
+            QListWidget::item:hover {{
+                background: #444;
+            }}
+            QListWidget::item:selected {{
+                background: #444;
+            }}
+            """
+        
+        self.setStyleSheet(qss)
+
+    def save_accessibility_settings(self):
+        """Save accessibility settings to config"""
+        self.config['enable_shortcuts'] = self.shortcuts_checkbox.isChecked()
+        self.config['high_contrast'] = self.high_contrast_checkbox.isChecked()
+        self.config['large_text'] = self.large_text_checkbox.isChecked()
+        self.save_config()
+        
+        # Apply settings immediately
+        self.apply_accessibility_settings()
+        self.setup_keyboard_shortcuts()
+        
+        QMessageBox.information(self, "Settings Saved", "Accessibility settings have been updated.")
+
+    def toggle_accessibility_settings(self):
+        """Toggle accessibility settings panel"""
+        visible = not self.accessibility_group.isVisible()
+        self.accessibility_group.setVisible(visible)
+        self.accessibility_toggle.setText("▲ Accessibility Settings" if visible else "▼ Accessibility Settings")
+
 
 
 if __name__ == "__main__":
