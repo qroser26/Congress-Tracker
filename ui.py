@@ -113,7 +113,6 @@ class CongressTracker(QWidget):
         if not self.tracking_started:
             return
             
-        print("_on_speech_index_double_clicked was called")
         item = self.speech_list.item(index.row())
         if item:
             self.on_speech_list_double_clicked(item)
@@ -359,17 +358,6 @@ class CongressTracker(QWidget):
         self.current_side = "Negative" if self.current_side == "Affirmative" else "Affirmative"
         self.side_indicator.setText("Neg" if self.current_side == "Negative" else "Aff")
 
-    def update_button_sizes(self):
-        """Ensure buttons don't exceed 60% of available width"""
-        # For speech tab
-        if self.speech_input_container.isVisible():
-            max_width = int(self.speech_input_container.width() * 0.6)
-            self.speech_log_button.setMaximumWidth(max_width)
-        
-        # For question tab
-        if self.question_log_button.isVisible():
-            max_width = int(self.question_log_button.parent().width() * 0.6)
-            self.question_log_button.setMaximumWidth(max_width)
 
     def add_resolution(self):
         text = self.resolution_input.text().strip()
@@ -396,34 +384,9 @@ class CongressTracker(QWidget):
         # If we have a current resolution, use it; otherwise use the first one
         if not self.current_resolution and self.resolution_list:
             self.current_resolution = self.resolution_list[0]
-            self.current_side = "Affirmative"
         
-        # FIX: Determine the next speaker based on speech history for this resolution
-        if self.current_resolution:
-            # Get all speeches for this resolution, sorted by timestamp
-            all_resolution_speeches = []
-            for c in self.competitors:
-                if hasattr(c, 'notes') and 'speeches' in c.notes:
-                    for speech in c.notes['speeches']:
-                        if isinstance(speech, dict) and speech.get('resolution') == self.current_resolution:
-                            speech_with_name = speech.copy()
-                            speech_with_name['competitor_name'] = c.name
-                            all_resolution_speeches.append(speech_with_name)
-            
-            # Sort by timestamp to find the most recent speech
-            all_resolution_speeches.sort(key=lambda x: x.get('timestamp', ''))
-            
-            if all_resolution_speeches:
-                # Get the side of the most recent speech
-                last_speech_side = all_resolution_speeches[-1].get('side', 'Aff')
-                # Next speaker should be the opposite side
-                if last_speech_side == 'Aff':
-                    self.current_side = "Negative"
-                else:
-                    self.current_side = "Affirmative"
-            else:
-                # No speeches yet, start with Affirmative
-                self.current_side = "Affirmative"
+        # FIX #2: Use the determine_next_speaker_side method for proper logic
+        self.current_side = self.determine_next_speaker_side(self.current_resolution)
         
         # Load competitor sides for this resolution
         for c in self.competitors:
@@ -443,12 +406,6 @@ class CongressTracker(QWidget):
         
         self.set_current_resolution(self.current_resolution)
     
-    def load_resolution_state(self):
-        """Load resolution state at startup"""
-        if self.resolution_list:
-            self.set_current_resolution(self.resolution_list[0])
-        else:
-            self.set_current_resolution("")
 
     def move_competitor(self, name, direction, list_type):
         """Move competitor up (-1) or down (+1) in the given recency list, and update rank in model."""
@@ -473,31 +430,6 @@ class CongressTracker(QWidget):
                 self.save_to_csv()  # This will now save the recency orders too!
         except ValueError:
             print(f"Competitor {name} not found in {list_type} list.")
-    def next_resolution(self):
-        if not self.resolution_list:
-            return
-            
-        current_idx = self.resolution_list.index(self.current_resolution) if self.current_resolution in self.resolution_list else -1
-        next_idx = (current_idx + 1) % len(self.resolution_list)
-        self.current_resolution = self.resolution_list[next_idx]
-        
-        # FIXED: Always reset to Affirmative (not based on current side)
-        self.current_side = "Affirmative"
-        
-        # Load saved sides for this resolution or clear if new resolution
-        for c in self.competitors:
-            if self.current_resolution in c.resolution_sides:
-                # Restore the saved side for this resolution
-                c.current_side = c.resolution_sides[self.current_resolution]
-            else:
-                # Clear side for new resolution
-                c.current_side = ""
-        
-        # Update UI
-        self.set_current_resolution(self.current_resolution)
-        self.update_resolution_display()
-        self.update_lists()
-        self.save_to_csv()
 
 
     def remove_resolution(self):
@@ -513,12 +445,83 @@ class CongressTracker(QWidget):
             if reply == QMessageBox.StandardButton.Yes:
                 self.resolution_list.remove(text)
                 self.resolution_list_widget.takeItem(self.resolution_list_widget.row(selected))
+                
+                # Clear aff/neg tags for this resolution from all competitors
+                for c in self.competitors:
+                    if text in c.resolution_sides:
+                        del c.resolution_sides[text]
+                    # If this was their current side, clear it
+                    if hasattr(c, 'current_side') and self.current_resolution == text:
+                        c.current_side = ""
+                
+                # Update current resolution
                 if self.current_resolution == text:
-                    self.current_resolution = self.resolution_list[0] if self.resolution_list else ""
-                    self.current_side = "Affirmative"
+                    if self.resolution_list:
+                        # Set to the first available resolution and determine next speaker
+                        self.current_resolution = self.resolution_list[0]
+                        self.current_side = self.determine_next_speaker_side(self.current_resolution)
+                        # Load sides for the new current resolution
+                        for c in self.competitors:
+                            if self.current_resolution in c.resolution_sides:
+                                c.current_side = c.resolution_sides[self.current_resolution]
+                            else:
+                                c.current_side = ""
+                    else:
+                        # No resolutions left
+                        self.current_resolution = ""
+                        self.current_side = "Affirmative"
+                        # Clear all current sides
+                        for c in self.competitors:
+                            c.current_side = ""
+                
+                # FIX #1: Update the settings panel label with proper current resolution
+                self.set_current_resolution(self.current_resolution)
+                
                 self.update_resolution_display()
+                self.update_lists()  # Update the lists to reflect cleared sides
                 self.save_to_csv()
                 self.update_resolution_combos()
+
+    def determine_next_speaker_side(self, resolution):
+        """
+        Determine which side should speak next for a given resolution.
+        Returns "Affirmative" or "Negative"
+        """
+        if not resolution:
+            # No specific resolution - count all speeches
+            total_aff = 0
+            total_neg = 0
+            
+            for c in self.competitors:
+                if hasattr(c, 'notes') and 'speeches' in c.notes:
+                    for speech in c.notes['speeches']:
+                        if isinstance(speech, dict):
+                            side = speech.get('side', '')
+                            if side == 'Aff':
+                                total_aff += 1
+                            elif side == 'Neg':
+                                total_neg += 1
+            
+            # If equal, Aff goes first; otherwise, the side with fewer speeches goes next
+            return "Affirmative" if total_aff <= total_neg else "Negative"
+        
+        else:
+            # Specific resolution - only count speeches for this resolution
+            aff_count = 0
+            neg_count = 0
+            
+            for c in self.competitors:
+                if hasattr(c, 'notes') and 'speeches' in c.notes:
+                    for speech in c.notes['speeches']:
+                        if isinstance(speech, dict) and speech.get('resolution') == resolution:
+                            side = speech.get('side', '')
+                            if side == 'Aff':
+                                aff_count += 1
+                            elif side == 'Neg':
+                                neg_count += 1
+            
+            # If equal, Aff goes first; otherwise, the side with fewer speeches goes next
+            return "Affirmative" if aff_count <= neg_count else "Negative"
 
     def update_resolution_display(self):
         """Update all resolution-related UI elements safely."""
@@ -853,9 +856,6 @@ class CongressTracker(QWidget):
                 QPushButton:hover { background: #ff9800; }
                 QPushButton:pressed { background: #e65100; }
             """)
-    def stop_timer(self):
-        self.timer.stop()
-        self.flash_timer.stop()  # Stop flashing when timer is stopped
 
     def reset_timer(self):
         """Reset the timer to initial state"""
@@ -1104,12 +1104,11 @@ class CongressTracker(QWidget):
             else:
                 c.current_side = ""
         
-        if resolution:
-            # Update settings panel label
-            if hasattr(self, 'resolution_settings_label'):
+        # FIX #1: Update settings panel label with proper display
+        if hasattr(self, 'resolution_settings_label'):
+            if resolution:
                 self.resolution_settings_label.setText(f"Current: {resolution}")
-        else:
-            if hasattr(self, 'resolution_settings_label'):
+            else:
                 self.resolution_settings_label.setText("Current: None")
         
         # FIX: Make sure to update all resolution displays
@@ -1127,7 +1126,7 @@ class CongressTracker(QWidget):
         self.layout = QVBoxLayout()
 
         # Initial input section
-        self.instructions = QLabel("Enter competitor names one by one, press Enter to add, then click Start")
+        self.instructions = QLabel("Enter competitor names one by one, press Enter to add, then click Start Tracking to begin!")
         self.layout.addWidget(self.instructions)
 
         self.name_input = QLineEdit()
@@ -1460,10 +1459,6 @@ class CongressTracker(QWidget):
         resolution_controls.addWidget(remove_res_btn)
         resolution_layout.addLayout(resolution_controls)
         
-        # Side toggle button
-        self.side_toggle_btn = QPushButton("Toggle Side")
-        self.side_toggle_btn.clicked.connect(self.toggle_current_side)
-        resolution_layout.addWidget(self.side_toggle_btn)
         
         self.resolution_group.setLayout(resolution_layout)
         self.resolution_group.setVisible(False)
@@ -1691,7 +1686,7 @@ Keyboard Shortcuts:
         self.apply_dark_mode()
         self.update_status(loaded=False)
         self.update_resolution_display()
-        self.load_resolution_state()
+        self.load_resolution_state_on_startup()
         self.tabs.currentChanged.connect(self.on_tab_changed)
         self.update_tab_indicators()
 
@@ -1766,16 +1761,6 @@ Keyboard Shortcuts:
                 self.stats_table.setItem(row, 1, QTableWidgetItem(side))
                 self.stats_table.setItem(row, 2, QTableWidgetItem(str(speech_count)))
                 self.stats_table.setItem(row, 3, QTableWidgetItem(time_str))
-    def reset_speech_inputs(self):
-        
-        self.speech_log_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.speech_log_button.setText("Log Speech")
-        self.speech_confirm_button.setVisible(False)
-        self.speech_cancel_button.setVisible(False)
-        self.pending_speech_competitor = None
-        self.minutes_input.clear()
-        self.seconds_input.clear()
-        self.side_indicator.setText("Aff")
 
     def _get_speeches_for_resolution(self, competitor, resolution):
         """Get speeches for a competitor filtered by resolution"""
@@ -1921,32 +1906,53 @@ Keyboard Shortcuts:
         # Load new category
         self.notes_edit.setPlainText(competitor.notes.get(category, ''))
 
-    def update_display_options(self):
-        # Show/hide resolution header
-        show_res = self.show_resolution_check.isChecked()
-        self.current_resolution_label.setVisible(show_res)
-        
-        # Update lists to show/hide sides
-        self.update_lists()
 
     def next_resolution(self):
+        """Handle next resolution logic based on current state"""
+        
         if not self.resolution_list:
+            # No resolutions added - reset to Affirmative and clear all current sides
+            self.current_side = "Affirmative"
+            # Clear all current sides since there's no resolution
+            for c in self.competitors:
+                c.current_side = ""
+            self.update_resolution_display()
+            self.update_lists()  # Refresh to show cleared sides
             return
-            
-        current_idx = self.resolution_list.index(self.current_resolution) if self.current_resolution in self.resolution_list else -1
-        next_idx = (current_idx + 1) % len(self.resolution_list)
+        
+        if len(self.resolution_list) == 1:
+            # Only one resolution - reset to Affirmative (don't allow switching to None)
+            self.current_side = "Affirmative"
+            self.update_resolution_display()
+            return
+        
+        # Multiple resolutions - cycle through them
+        try:
+            current_idx = self.resolution_list.index(self.current_resolution)
+            next_idx = (current_idx + 1) % len(self.resolution_list)
+        except ValueError:
+            # Current resolution not in list, start from beginning
+            next_idx = 0
+        
+        # Save current sides for the current resolution before switching
+        if self.current_resolution:
+            for c in self.competitors:
+                if c.current_side:
+                    c.resolution_sides[self.current_resolution] = c.current_side
+        
+        # Switch to next resolution
         self.current_resolution = self.resolution_list[next_idx]
         
-        # FIXED: Always reset to Affirmative (not based on current side)
+        # Always reset to Affirmative when switching resolutions
         self.current_side = "Affirmative"
         
-        # FIX: Load saved sides for this resolution OR determine from speech history
+        # Load or clear sides for the new resolution
         for c in self.competitors:
             if self.current_resolution in c.resolution_sides:
-                # Restore the saved side for this resolution
+                # Restore saved side for this resolution
                 c.current_side = c.resolution_sides[self.current_resolution]
             else:
-                # FIX: Check if they have speeches for this resolution and determine side
+                # Check speech history to determine side
                 if hasattr(c, 'notes') and 'speeches' in c.notes:
                     resolution_speeches = [s for s in c.notes['speeches'] 
                                         if isinstance(s, dict) and s.get('resolution') == self.current_resolution]
@@ -1956,7 +1962,7 @@ Keyboard Shortcuts:
                         # Save this side for future reference
                         c.resolution_sides[self.current_resolution] = c.current_side
                     else:
-                        # Clear side for new resolution
+                        # Clear side for new resolution (they haven't spoken on it yet)
                         c.current_side = ""
                 else:
                     # Clear side for new resolution
@@ -1982,19 +1988,6 @@ Keyboard Shortcuts:
         dialog.close()
 
 
-    def start_speech_confirmation(self, competitor):
-        # Hide input fields
-        self.side_indicator.setVisible(False)
-        self.minutes_input.setVisible(False)
-        self.seconds_input.setVisible(False)
-        self.side_toggle_btn.setVisible(False)
-        
-        # Change button text
-        self.speech_log_button.setText(f"Log for {competitor.name}?")
-        
-        # Show confirm/cancel buttons
-        self.speech_confirm_button.setVisible(True)
-        self.speech_cancel_button.setVisible(True)
 
     # Update on_speech_log_button_clicked
     def on_speech_log_button_clicked(self):
@@ -2023,48 +2016,6 @@ Keyboard Shortcuts:
         
         self.start_speech_animation_for_pending()
 
-    def start_question_animation(self, competitor):
-        # 1) Show the full question row
-        self.question_input_container.setVisible(True)
-
-        # 2) Prep the log button and hide cancel
-        self.question_log_button.setText("▶ Log Question")
-        self.question_cancel_button.setVisible(False)
-
-        try: self.question_log_button.clicked.disconnect()
-        except: pass
-        self.question_log_button.clicked.connect(lambda: _run_q())
-
-        def _run_q():
-            anim = QParallelAnimationGroup(self)
-            combo_anim = QPropertyAnimation(self.question_name_input, b"maximumWidth")
-            combo_anim.setDuration(250)
-            combo_anim.setStartValue(self.question_name_input.width())
-            combo_anim.setEndValue(0)
-            anim.addAnimation(combo_anim)
-
-            btn = self.question_log_button
-            geom = btn.geometry()
-            btn.move(self.question_input_container.width() + 10, geom.y())
-            btn_anim = QPropertyAnimation(btn, b"pos")
-            btn_anim.setDuration(250)
-            end = geom.topLeft()
-            btn_anim.setStartValue(end + QPoint(80, 0))
-            btn_anim.setEndValue(end)
-            anim.addAnimation(btn_anim)
-
-            def on_done_q():
-                name = competitor.name
-                btn.setText(f"✔ Log Question for {name}")
-                try: btn.clicked.disconnect()
-                except: pass
-                btn.clicked.connect(self.confirm_log_question)
-                self.question_cancel_button.setVisible(True)
-            anim.finished.connect(on_done_q)
-            anim.finished.connect(anim.deleteLater)
-            anim.start()
-
-
 
     def open_data_folder(self):
         if self.csv_file_path and os.path.exists(self.csv_file_path):
@@ -2086,75 +2037,6 @@ Keyboard Shortcuts:
         self.save_config()
         QMessageBox.information(self, "Settings Saved", "Timer settings have been updated.")
 
-    def on_speech_input_entered(self):
-        name = self.speech_name_input.currentText().strip()
-        competitor = self.find_competitor(name)
-        if competitor:
-            self.pending_speech_competitor = competitor
-            self.speech_log_button.setText(f"Log Speech for {competitor.name}")
-            self.start_speech_animation(competitor)
-        else:
-            QMessageBox.warning(self, "Error", f"No competitor named '{name}' found.")
-
-    def start_speech_animation(self, competitor):
-        # 1) Ensure the input row (with combo, side, time, buttons) is shown
-        self.speech_input_container.setVisible(True)
-
-        # 2) Prep buttons off to the right
-        #    We’ll use speech_log_button as both “▶ Log” and then “✔ Confirm”,
-        #    and speech_cancel_button stays the same.
-        self.speech_log_button.setText("▶ Log Speech")
-        self.speech_cancel_button.setVisible(False)
-
-        # Disconnect any old handlers, then make Log start the animation
-        try: self.speech_log_button.clicked.disconnect()
-        except: pass
-        self.speech_log_button.clicked.connect(lambda: _run())
-
-        def _run():
-            # Slide‐away the combo, leaving side/time intact
-            anim = QParallelAnimationGroup(self)
-            combo_anim = QPropertyAnimation(self.speech_name_input, b"maximumWidth")
-            combo_anim.setDuration(250)
-            combo_anim.setStartValue(self.speech_name_input.width())
-            combo_anim.setEndValue(0)
-            anim.addAnimation(combo_anim)
-
-            # Slide the same button in
-            btn = self.speech_log_button
-            geom = btn.geometry()
-            btn.move(self.speech_input_container.width() + 10, geom.y())
-            btn_anim = QPropertyAnimation(btn, b"pos")
-            btn_anim.setDuration(250)
-            end = geom.topLeft()
-            btn_anim.setStartValue(end + QPoint(80, 0))
-            btn_anim.setEndValue(end)
-            anim.addAnimation(btn_anim)
-
-            # When done, swap to “Confirm” mode
-            def on_done():
-                name = competitor.name
-                btn.setText(f"✔ Log Speech for {name}")
-                try: btn.clicked.disconnect()
-                except: pass
-                btn.clicked.connect(self.confirm_log_speech)
-                self.speech_cancel_button.setVisible(True)
-            anim.finished.connect(on_done)
-            anim.finished.connect(anim.deleteLater)
-            anim.start()
-
-        # Kick off the first-phase (so _run is defined)
-        # we don’t call it yet—only on button click
-
-
-
-
-    def update_speech_duration(self):
-        if self.speech_start_time:
-            elapsed = datetime.datetime.now() - self.speech_start_time
-            mins = elapsed.seconds // 60
-            secs = elapsed.seconds % 60
-            self.speech_duration_label.setText(f"Duration: {mins}:{secs:02}")
     def apply_dark_mode(self):
         qss = """
         /* Base colors */
@@ -2216,12 +2098,6 @@ border: 1px solid #444;
         self.save_config()
         self.update_timer_visibility()
 
-    def set_timer_visibility(self, visible):
-        """Helper method to set visibility of all timer elements"""
-        self.timer_label.setVisible(visible)
-        self.start_timer_button.setVisible(visible)
-        self.stop_timer_button.setVisible(visible) 
-        self.reset_timer_button.setVisible(visible)
 
     def save_config(self):
         try:
@@ -2550,50 +2426,6 @@ border: 1px solid #444;
         self.resolution_group.setVisible(visible)
         self.resolution_toggle.setText("▲ Resolution Settings" if visible else "▼ Resolution Settings")
 
-    def log_speech(self):
-        if not self.pending_speech_competitor:
-            QMessageBox.warning(self, "Error", "No competitor selected for speech.")
-            return
-        
-        competitor = self.pending_speech_competitor
-        old_speeches = competitor.speeches
-        
-        # Get time input (optional)
-        minutes = self.minutes_input.text().strip() or "0"
-        seconds = self.seconds_input.text().strip() or "0"
-        
-        try:
-            duration = int(minutes) * 60 + int(seconds)
-        except ValueError:
-            duration = 0
-        
-        # Assign side if not set
-        if not competitor.current_side:
-            competitor.current_side = "Aff" if self.current_side == "Affirmative" else "Neg"
-        
-        competitor.add_speech(
-            round_num=self.current_round,
-            side=competitor.current_side,
-            duration=duration
-        )
-        
-        # Toggle global side for next speaker
-        self.current_side = "Negative" if self.current_side == "Affirmative" else "Affirmative"
-        
-        self.current_round += 1
-        competitor.last_speech_round = self.current_round
-        self.log_history('speech', competitor.name, 'increment', old_speeches, competitor.speeches)
-        self.update_lists()
-        self.save_to_csv()
-        self.update_resolution_display()
-        
-        # Clear inputs
-        self.minutes_input.clear()
-        self.seconds_input.clear()
-        self.speech_name_input.clear()
-        self.side_indicator.clear()
-        self.pending_speech_competitor = None
-        self.speech_input_container.setVisible(False)
     def cancel_log_speech(self):
         # 1) Reset layout and UI
         self.speech_confirm_button.setVisible(False)
@@ -2606,27 +2438,6 @@ border: 1px solid #444;
 
         self.pending_speech_competitor = None
         self.speech_list.clearSelection()
-
-
-
-    
-    def log_question(self):
-        name = self.question_name_input.currentText().strip()
-        if not name:
-            QMessageBox.warning(self, "Error", "Please select a competitor.")
-            return
-        
-        competitor = self.find_competitor(name)
-        if not competitor:
-            QMessageBox.warning(self, "Error", f"Competitor '{name}' not found.")
-            return
-        
-        self.pending_question_competitor = competitor
-        self.question_log_button.setText(f"Log Question for {competitor.name}")
-        self.start_question_animation(competitor)
-        
-        # Connect confirm button with current state
-        self.question_confirm_button.clicked.connect(lambda: self.confirm_log_question(competitor))
     
 
     def on_tab_changed(self, index):
@@ -2665,6 +2476,11 @@ border: 1px solid #444;
         # 3d) Capture new count
         new_count = competitor.speeches
 
+        # FIX: Update recency order - move this competitor to the end
+        if competitor.name in self.speech_recency_order:
+            self.speech_recency_order.remove(competitor.name)
+        self.speech_recency_order.append(competitor.name)
+
         # 3e) Record in history
         self.log_history(
             action_type='speech',
@@ -2700,9 +2516,8 @@ border: 1px solid #444;
         self.seconds_input.clear()
 
 
-
     def confirm_log_question(self):
-        # 1) Re‐implement your original “log question” steps:
+        # 1) Re‑implement your original "log question" steps:
         if not self.pending_question_competitor:
             QMessageBox.warning(self, "Error", "No competitor selected")
             return
@@ -2711,6 +2526,12 @@ border: 1px solid #444;
         old_questions = c.questions
         c.questions += 1
         c.last_question_round = self.current_round
+        
+        # FIX: Update recency order - move this competitor to the end
+        if c.name in self.question_recency_order:
+            self.question_recency_order.remove(c.name)
+        self.question_recency_order.append(c.name)
+        
         self.current_round += 1
 
         self.log_history(
@@ -2806,10 +2627,16 @@ border: 1px solid #444;
                 idx = self.question_recency_order.index(old_name)
                 self.question_recency_order[idx] = new_name
                     
-            # Update all lists and UI
+            # Update all lists and UI immediately
             self.update_lists()
             self.update_competitor_combos()
             self.save_to_csv()
+            
+            # Force refresh of the manage list to show the new name
+            self.manage_list.clear()
+            for c in sorted(self.competitors, key=lambda x: x.name.lower()):
+                self.manage_list.addItem(c.name)
+            self.update_manage_buttons()
     
     def update_lists(self):
         # 1) If no data, just show names
@@ -3000,29 +2827,6 @@ border: 1px solid #444;
         for c in sorted(self.competitors, key=lambda x: x.name.lower()):
             self.manage_list.addItem(c.name)
         self.update_manage_buttons()
-
-
-
-    def rename_competitor(self):
-            selected_items = self.manage_list.selectedItems()
-            if not selected_items:
-                return
-            old_name = selected_items[0].text()
-            new_name, ok = QInputDialog.getText(self, "Rename Competitor", f"Rename '{old_name}' to:")
-            if ok and new_name.strip():
-                new_name = new_name.strip()
-                if any(c.name.lower() == new_name.lower() for c in self.competitors):
-                    QMessageBox.warning(self, "Error", f"A competitor named '{new_name}' already exists.")
-                    return
-                for c in self.competitors:
-                    if c.name == old_name:
-                        c.name = new_name
-                        break
-                self.update_competitor_combos()
-                self.update_lists()
-                self.save_to_csv()
-
-
 
 
     def delete_competitor(self):
